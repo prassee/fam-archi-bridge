@@ -1,0 +1,174 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wal-writer
+  namespace: cdc
+  labels:
+    app: wal-writer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wal-writer
+  template:
+    metadata:
+      labels:
+        app: wal-writer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: wal-writer
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: wal-writer
+        image: wal-writer:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pod-name=$(POD_NAME)
+        - --pod-ip=$(POD_IP)
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: WAL_WRITER_PG_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PG_HOST
+              optional: true
+        - name: WAL_WRITER_PG_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PG_PORT
+              optional: true
+        - name: WAL_WRITER_PG_USER
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PG_USER
+              optional: true
+        - name: WAL_WRITER_PG_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wal-writer-secret
+              key: WAL_WRITER_PG_PASSWORD
+        - name: WAL_WRITER_PG_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PG_DATABASE
+              optional: true
+        - name: WAL_WRITER_KAFKA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_BROKERS
+              optional: true
+        - name: WAL_WRITER_KAFKA_TOPIC_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_TOPIC_PREFIX
+        - name: WAL_WRITER_KAFKA_ACKS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_ACKS
+        - name: WAL_WRITER_KAFKA_LINGER_MS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_LINGER_MS
+        - name: WAL_WRITER_KAFKA_BATCH_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_BATCH_SIZE
+        - name: WAL_WRITER_REPLICATION_BATCH_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_REPLICATION_BATCH_SIZE
+        - name: WAL_WRITER_REPLICATION_POLL_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_REPLICATION_POLL_INTERVAL_MS
+        - name: WAL_WRITER_LOGGING_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_LOGGING_LEVEL
+        ports:
+        - containerPort: 9090
+          name: metrics
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log/wal-writer
+      volumes:
+      - name: logs
+        emptyDir:
+          sizeLimit: 1Gi
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        fsGroup: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wal-writer
+  namespace: cdc
+  labels:
+    app: wal-writer
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+  selector:
+    app: wal-writer
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wal-writer-pdb
+  namespace: cdc
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: wal-writer

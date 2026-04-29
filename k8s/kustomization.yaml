@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - configmap.yaml
+  - deployment.yaml
+
+commonLabels:
+  app: wal-writer
+
+configMapGenerator:
+  - name: wal-writer-config
+    literals:
+    - WAL_WRITER_PG_HOST=postgres.default
+    - WAL_WRITER_PG_PORT=5432
+    - WAL_WRITER_PG_USER=postgres
+    - WAL_WRITER_PG_DATABASE=postgres
+    - WAL_WRITER_PG_SLOT_NAME=wal_writer_slot
+    - WAL_WRITER_KAFKA_BROKERS=localhost:9092
+
+images:
+  - name: wal-writer
+    newTag: latest

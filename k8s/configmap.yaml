@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wal-writer-config
+  namespace: cdc
+  labels:
+    app: wal-writer
+data:
+  WAL_WRITER_KAFKA_TOPIC_PREFIX: "cdc"
+  WAL_WRITER_KAFKA_ACKS: "all"
+  WAL_WRITER_KAFKA_LINGER_MS: "5"
+  WAL_WRITER_KAFKA_BATCH_SIZE: "16384"
+  WAL_WRITER_REPLICATION_BATCH_SIZE: "100"
+  WAL_WRITER_REPLICATION_POLL_INTERVAL_MS: "10"
+  WAL_WRITER_LOGGING_LEVEL: "info"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wal-writer-secret
+  namespace: cdc
+  labels:
+    app: wal-writer
+type: Opaque
+stringData:
+  WAL_WRITER_PG_PASSWORD: "" # Set via sealed secret or external secret store
+  # WAL_WRITER_KAFKA_BROKERS: "localhost:9092"
+  # WAL_WRITER_PG_HOST: "postgres.default"
+  # WAL_WRITER_PG_USER: "postgres"
+  # WAL_WRITER_PG_DATABASE: "postgres"
+  # WAL_WRITER_PG_SLOT_NAME: "wal_writer_slot"
