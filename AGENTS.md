@@ -66,6 +66,8 @@ kubectl apply -f k8s/
 - `k8s/configmap.yaml` - Configuration
 - `k8s/deployment.yaml` - Deployment + Service + PDB
 - `k8s/rbac.yaml` - ServiceAccount + RBAC
+- `k8s/postgres.yaml` - PostgreSQL with logical replication
+- `k8s/kafka.yaml` - Kafka broker
 - `k8s/kustomization.yaml` - Kustomize overlay
 
 ### Resource Limits
@@ -77,6 +79,17 @@ kubectl apply -f k8s/
 
 - 2 replicas with pod anti-affinity
 - PodDisruptionBudget: minAvailable: 1
+
+## Local Testing
+
+```bash
+# Deploy infra (PostgreSQL + Kafka)
+kubectl apply -k k8s/ -t infra
+
+# Or individually
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/kafka.yaml
+```
 
 ## Notes
 

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
