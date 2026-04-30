@@ -11,10 +11,12 @@ mod decoder;
 mod kafka;
 mod metrics;
 mod pg_replication;
+mod state;
 mod wal_parser;
 
 pub use config::AppConfig;
 pub use metrics::Metrics;
+pub use state::LsnTracker;
 
 #[tokio::main]
 async fn main() -> Result<()> {

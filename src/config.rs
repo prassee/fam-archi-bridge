@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::env;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AppConfig {
@@ -7,10 +8,13 @@ pub struct AppConfig {
     pub kafka: KafkaConfig,
     pub replication: ReplicationConfig,
     pub logging: LoggingConfig,
+    pub state: StateConfig,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, env::VarError> {
+        let state_dir = env::var("WAL_WRITER_STATE_DIR").ok().map(PathBuf::from);
+        
         Ok(Self {
             pg: PostgresConfig {
                 host: env::var("WAL_WRITER_PG_HOST").unwrap_or_else(|_| "localhost".to_string()),
@@ -33,6 +37,13 @@ impl AppConfig {
             },
             replication: ReplicationConfig::default(),
             logging: LoggingConfig::default(),
+            state: StateConfig {
+                directory: state_dir,
+                persist_interval_secs: env::var("WAL_WRITER_STATE_PERSIST_INTERVAL_SECS")
+                    .unwrap_or_else(|_| "60".to_string())
+                    .parse()
+                    .unwrap_or(60),
+            },
         })
     }
 }
@@ -104,6 +115,21 @@ impl Default for LoggingConfig {
         Self {
             directory: String::from("/var/log/wal-writer"),
             level: String::from("info"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct StateConfig {
+    pub directory: Option<PathBuf>,
+    pub persist_interval_secs: u64,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            persist_interval_secs: 60,
         }
     }
 }
