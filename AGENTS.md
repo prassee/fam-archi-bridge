@@ -101,3 +101,16 @@ kubectl apply -f k8s/kafka.yaml
 - WAL parser implemented with pg_walstream: decodes Relation/Begin/Commit/Insert/Update/Delete/Truncate messages, caches relation metadata, maps tuple columns to named columns and attaches transaction metadata when available
 - Unit test added: tests/wal_parser_tests.rs (basic empty payload test). More fixtures can be added using pg_walstream helpers
 - Note: building pg_walstream requires libpq headers on some systems. On macOS install libpq via Homebrew: `brew install libpq && brew link --force libpq`
+
+## Next Steps
+
+1. Fully consume multi-message WAL payloads in the parser
+   - Use pg_walstream's BufferReader-based API to iterate messages from a single Bytes payload and return all messages as WalRecord entries. This avoids relying on the replication stream to provide one message per payload.
+2. Wire parser into replication loop end-to-end
+   - Call WalParser::parse() from the replication XLogData handler, batch results and pass them to WalDecoder::send_batch, ensuring LSN persistence on commit and graceful shutdown flows flush pending Kafka messages.
+3. Add comprehensive unit & integration tests
+   - Create fixtures for Insert/Update/Delete/Truncate using pg_walstream test helpers and assert decoded WalRecord contents (column names, types, values, tx metadata).
+4. Clean up and observability
+   - Make Metrics shared (Arc) so counters are updated across tasks, remove unused imports, and silence remaining warnings. Add more unit tests for metrics and decoder behaviour.
+
+If you want I can implement these steps in order. Stopping now as requested.
