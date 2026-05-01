@@ -9,19 +9,21 @@ resources:
   - kafka.yaml
   - deployment.yaml
 
-commonLabels:
-  app: wal-writer
+labels:
+  - includeSelectors: true
+    pairs:
+      app: wal-writer
 
 configMapGenerator:
   - name: wal-writer-config
     literals:
-    - WAL_WRITER_PG_HOST=postgres.cdc.svc.cluster.local
-    - WAL_WRITER_PG_PORT=5432
-    - WAL_WRITER_PG_USER=postgres
-    - WAL_WRITER_PG_DATABASE=postgres
-    - WAL_WRITER_PG_SLOT_NAME=wal_writer_slot
-    - WAL_WRITER_KAFKA_BROKERS=kafka.cdc.svc.cluster.local:9092
-    - WAL_WRITER_KAFKA_TOPIC_PREFIX=cdc
+      - WAL_WRITER_PG_HOST=postgres.cdc.svc.cluster.local
+      - WAL_WRITER_PG_PORT=5432
+      - WAL_WRITER_PG_USER=postgres
+      - WAL_WRITER_PG_DATABASE=postgres
+      - WAL_WRITER_PG_SLOT_NAME=wal_writer_slot
+      - WAL_WRITER_KAFKA_BROKERS=kafka.cdc.svc.cluster.local:9092
+      - WAL_WRITER_KAFKA_TOPIC_PREFIX=cdc
 
 images:
   - name: wal-writer
@@ -36,3 +38,4 @@ patches:
       kind: Deployment
       name: wal-writer
       labelSelector: app=wal-writer
+

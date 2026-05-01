@@ -1,0 +1,147 @@
+version: '3.8'
+
+# Docker Compose manifest derived from Kubernetes manifests in k8s/ folder
+# Includes all services, configurations, volumes, and environment variables
+
+services:
+  # PostgreSQL with logical replication enabled
+  # Derived from k8s/postgres.yaml
+  postgres:
+    image: postgres:16-alpine
+    container_name: wal-writer-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    # Resource hints (K8s requests: 500m CPU, 512Mi memory; limits: 1000m CPU, 1Gi memory)
+
+  # Kafka broker
+  # Derived from k8s/kafka.yaml
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: wal-writer-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLPLAINTEXT:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_OFFSET_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    # Resource hints (K8s requests: 500m CPU, 1Gi memory; limits: 1000m CPU, 2Gi memory)
+
+  # WAL Writer service
+  # Derived from k8s/deployment.yaml and k8s/configmap.yaml
+  wal-writer:
+    image: wal-writer:latest
+    container_name: wal-writer
+    hostname: wal-writer
+    build:
+      context: ./wal_writer
+      dockerfile: Dockerfile
+    ports:
+      - "9090:9090"
+    environment:
+      # Pod metadata (simulated from K8s downward API)
+      POD_NAME: wal-writer
+      POD_IP: 172.18.0.4
+      # PostgreSQL config (from k8s/kustomization.yaml and k8s/configmap.yaml)
+      WAL_WRITER_PG_HOST: postgres
+      WAL_WRITER_PG_PORT: 5432
+      WAL_WRITER_PG_USER: postgres
+      WAL_WRITER_PG_PASSWORD: postgres
+      WAL_WRITER_PG_DATABASE: postgres
+      WAL_WRITER_PG_SLOT_NAME: wal_writer_slot
+      # Kafka config (from k8s/kustomization.yaml and k8s/configmap.yaml)
+      WAL_WRITER_KAFKA_BROKERS: kafka:9092
+      WAL_WRITER_KAFKA_TOPIC_PREFIX: cdc
+      WAL_WRITER_KAFKA_ACKS: all
+      WAL_WRITER_KAFKA_LINGER_MS: 5
+      WAL_WRITER_KAFKA_BATCH_SIZE: 16384
+      # Replication config (from k8s/configmap.yaml)
+      WAL_WRITER_REPLICATION_BATCH_SIZE: 100
+      WAL_WRITER_REPLICATION_POLL_INTERVAL_MS: 10
+      # Logging config (from k8s/configmap.yaml)
+      WAL_WRITER_LOGGING_LEVEL: info
+      WAL_WRITER_LOGGING_DIRECTORY: /var/log/wal-writer
+      # Note: K8s uses ConfigMap and Secret for these values
+      # ConfigMap: wal-writer-config (k8s/configmap.yaml + k8s/kustomization.yaml)
+      # Secret: wal-writer-secret (k8s/configmap.yaml)
+    command:
+      - "--pod-name=$(POD_NAME)"
+      - "--pod-ip=$(POD_IP)"
+    volumes:
+      - logs-data:/var/log/wal-writer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    # Resource hints (K8s requests: 500m CPU, 512Mi memory; limits: 2000m CPU, 2Gi memory)
+    # Note: K8s deployment has 2 replicas with pod anti-affinity
+    # For local testing, use 1 replica; scale with: docker-compose up --scale wal-writer=2
+
+volumes:
+  postgres-data:
+    driver: local
+    # K8s: 5Gi storage
+  kafka-data:
+    driver: local
+    # K8s: 10Gi storage
+  logs-data:
+    driver: local
+    # K8s: emptyDir with sizeLimit 1Gi
+
+# Note: The following K8s features are not directly supported in Docker Compose:
+# - Namespace (k8s/rbac.yaml creates namespace "cdc")
+# - ServiceAccount, Role, RoleBinding (k8s/rbac.yaml)
+# - PodDisruptionBudget (k8s/deployment.yaml)
+# - Pod anti-affinity (k8s/deployment.yaml)
+# - StatefulSet (k8s/postgres.yaml, k8s/kafka.yaml - using regular services instead)
+# - ConfigMap and Secret separation (using environment variables directly)
+# - livenessProbe and readinessProbe paths (/health, /ready on port 9090)

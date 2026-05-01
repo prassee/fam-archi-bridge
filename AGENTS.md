@@ -8,21 +8,29 @@ High-throughput CDC capture from PostgreSQL WAL with sub-second latency, designe
 rust-wal-cake-writer/
 ├── AGENTS.md                 # This file
 ├── .gitignore
+├── docker-compose.yml        # Local development setup
 ├── k8s/                      # Kubernetes manifests
 │   ├── configmap.yaml
 │   ├── deployment.yaml
 │   ├── kafka.yaml
 │   ├── kustomization.yaml
+│   ├── namespace.yaml
 │   ├── postgres.yaml
 │   └── rbac.yaml
-├── data_pump/                # Python data pump utility
+├── data_pump/                 # Python data pump utility
 │   ├── main.py
 │   ├── pyproject.toml
 │   ├── README.md
 │   └── .python-version
+├── data_pump_go/             # Go data pump utility (equivalent to Python version)
+│   ├── main.go
+│   ├── go.mod
+│   ├── go.sum
+│   └── README.md
 └── wal_writer/               # Main Rust project
     ├── Cargo.toml
     ├── Cargo.lock
+    ├── Dockerfile
     ├── src/
     │   ├── main.rs           # Entry point
     │   ├── lib.rs            # Library root
