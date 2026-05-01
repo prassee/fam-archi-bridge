@@ -2,11 +2,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use futures::StreamExt;
-use tokio::sync::mpsc;
-use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
+use tokio_postgres::NoTls;
 
 use crate::config::AppConfig;
 use crate::decoder::WalDecoder;
@@ -14,6 +11,8 @@ use crate::kafka::KafkaProducer;
 use crate::metrics::Metrics;
 use crate::state::LsnTracker;
 use crate::wal_parser::WalParser;
+
+use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent};
 
 pub struct WalReader {
     config: Arc<AppConfig>,
@@ -48,137 +47,87 @@ impl WalReader {
         if let Err(e) = self.lsn_tracker.load().await {
             warn!("Failed to load LSN state: {}", e);
         }
+        let slot_name = self.config.pg.slot_name().to_string();
 
-        self.ensure_replication_slot().await?;
+        // Build replication client config
+        let cfg = ReplicationConfig {
+            host: self.config.pg.host.clone(),
+            port: self.config.pg.port,
+            user: self.config.pg.user.clone(),
+            password: self.config.pg.password.clone(),
+            database: self.config.pg.database.clone(),
+            slot: slot_name.clone(),
+            publication: self.config.replication.wal_position.clone().unwrap_or_else(|| self.config.pg.database.clone()),
+            start_lsn: 0.into(),
+            ..Default::default()
+        };
 
-        let connection_string = self.config.pg.connection_string();
-        let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
-            .await
-            .context("Failed to connect to PostgreSQL")?;
+        let mut client = ReplicationClient::connect(cfg).await.context("Failed to connect replication client")?;
+        info!("Connected replication client for slot {}", slot_name);
 
-        let slot_name = self.config.pg.slot_name();
-        
-        // Get last consumed position or start from beginning
-        let start_lsn = self.lsn_tracker.get_last_lsn(slot_name).await
-            .unwrap_or_else(|| "0/0".to_string());
-        
-        let query = format!(
-            "START_REPLICATION SLOT {} LOGICAL {}",
-            slot_name,
-            start_lsn
-        );
-
-        info!("Starting replication from LSN: {}", start_lsn);
-
-        let stream = client.copy_out(&query).await?;
-        let (sender, mut receiver) = mpsc::channel::<Bytes>(1000);
-        
-        let stream = Box::pin(stream);
-        
-        tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(data) => {
-                        if let Err(e) = sender.send(data).await {
-                            error!("Failed to send WAL data: {}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Replication stream error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        let config = self.config.clone();
         let parser = WalParser::new();
         let decoder = self.decoder.clone();
         let lsn_tracker = self.lsn_tracker.clone();
         let metrics = self.metrics.clone();
-        let persist_interval = std::time::Duration::from_secs(config.state.persist_interval_secs);
 
-        tokio::spawn(async move {
-            let mut batch = Vec::new();
-            let mut last_batch_time = std::time::Instant::now();
-            let batch_size = config.replication.batch_size as usize;
-            let poll_interval =
-                std::time::Duration::from_millis(config.replication.poll_interval_ms as u64);
+        // Receive replication events
+        loop {
+            match client.recv().await.context("Failed to receive replication event")? {
+                Some(ReplicationEvent::XLogData { wal_start: _, wal_end, data, server_time_micros: _ }) => {
+                    debug!("Received XLogData {} bytes at {}", data.len(), wal_end.as_u64());
+                    metrics.inc_by(data.len() as u64);
 
-            loop {
-                let timeout = tokio::time::timeout(poll_interval, receiver.recv()).await;
+                    match parser.parse(&data) {
+                        Ok(records) => {
+                            metrics.wal_records_parsed_inc(records.len() as u64);
+                            if !records.is_empty() {
+                                if let Err(e) = decoder.send_batch(&records).await {
+                                    error!("Failed to send batch to Kafka: {}", e);
+                                }
+                                metrics.batches_sent_inc();
 
-                match timeout {
-                    Ok(Some(data)) => {
-                        debug!("Received WAL data: {} bytes", data.len());
-                        metrics.inc_by(data.len() as u64);
-
-                        match parser.parse(&data) {
-                            Ok(records) => {
-                                metrics.wal_records_parsed_inc(records.len() as u64);
-                                batch.extend(records);
-
-                                if batch.len() >= batch_size {
-                                    if let Err(e) = decoder.send_batch(&batch).await {
-                                        error!("Failed to send batch to Kafka: {}", e);
-                                    }
-                                    metrics.batches_sent_inc();
-                                    
-                                    // Persist LSN after successful batch
-                                    if let Some(record) = batch.last() {
-                                        let lsn = format!("{}/{}", record.lsn >> 32, record.lsn & 0xFFFFFFFF);
-                                        let _ = lsn_tracker.persist("wal_writer_slot", &lsn).await;
-                                    }
-                                    batch.clear();
-                                    last_batch_time = std::time::Instant::now();
+                                if let Some(record) = records.last() {
+                                    let lsn = format!("{}/{}", record.lsn >> 32, record.lsn & 0xFFFFFFFF);
+                                    let _ = lsn_tracker.persist(&slot_name, &lsn).await;
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to parse WAL data: {}", e);
-                                metrics.parsing_errors_inc();
-                            }
                         }
-                    }
-                    Ok(None) => {
-                        info!("Replication stream ended");
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout - flush batch if needed and persist LSN periodically
-                        if !batch.is_empty() {
-                            if let Err(e) = decoder.send_batch(&batch).await {
-                                error!("Failed to send batch to Kafka: {}", e);
-                            }
-                            metrics.batches_sent_inc();
-                            
-                            if let Some(record) = batch.last() {
-                                let lsn = format!("{}/{}", record.lsn >> 32, record.lsn & 0xFFFFFFFF);
-                                let _ = lsn_tracker.persist("wal_writer_slot", &lsn).await;
-                            }
-                            batch.clear();
-                            last_batch_time = std::time::Instant::now();
+                        Err(e) => {
+                            warn!("Failed to parse WAL data: {}", e);
+                            metrics.parsing_errors_inc();
                         }
                     }
                 }
+                Some(ReplicationEvent::Begin { final_lsn, xid: _, commit_time_micros: _ }) => {
+                    // Could use begin event for transactional boundary handling
+                    debug!("Replication begin at {}", final_lsn.as_u64());
+                }
+                Some(ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros: _ }) => {
+                    debug!("Replication commit at {} (end {})", lsn.as_u64(), end_lsn.as_u64());
+                    // Persist LSN on commit boundary
+                    let lsn_str = format!("{}/{}", end_lsn.as_u64() >> 32, end_lsn.as_u64() & 0xFFFFFFFF);
+                    let _ = lsn_tracker.persist(&slot_name, &lsn_str).await;
+                }
+                Some(ReplicationEvent::KeepAlive { wal_end, reply_requested: _, server_time_micros: _ }) => {
+                    debug!("Keepalive at {}", wal_end.as_u64());
+                }
+                Some(ReplicationEvent::Message { transactional: _, lsn, prefix, content }) => {
+                    debug!("Logical message {} at {} prefix={}", content.len(), lsn.as_u64(), prefix);
+                    // treat message content as an event or log it
+                }
+                Some(ReplicationEvent::StoppedAt { reached }) => {
+                    info!("Replication stopped at {}", reached.as_u64());
+                    break;
+                }
+                None => {
+                    // recv returned None: replication worker closed the channel
+                    info!("Replication event stream closed");
+                    break;
+                }
             }
+        }
 
-            // Final flush
-            if !batch.is_empty() {
-                let _ = decoder.send_batch(&batch).await;
-            }
-        });
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("Connection error: {}", e);
-            }
-        });
-
-        tokio::signal::ctrl_c().await?;
         info!("Shutting down WAL reader");
-
         Ok(())
     }
 

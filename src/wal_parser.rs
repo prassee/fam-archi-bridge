@@ -1,8 +1,15 @@
 #![allow(dead_code)]
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
+
+use pg_walstream::LogicalReplicationParser;
+use pg_walstream::LogicalReplicationMessage;
+use pg_walstream::TupleData;
+use pg_walstream::ColumnData;
+use pg_walstream::RelationInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalRecord {
@@ -60,161 +67,173 @@ pub enum ColumnValue {
     Bytes(Vec<u8>),
 }
 
-pub struct WalParser {
-    decode_datum: fn(u32, &[u8], bool) -> Result<ColumnValue>,
-}
+pub struct WalParser {}
 
 impl WalParser {
     pub fn new() -> Self {
-        Self {
-            decode_datum: |_type_oid, _data, _is_toasted| -> Result<ColumnValue> {
-                Ok(ColumnValue::Bytes(_data.to_vec()))
-            },
-        }
+        Self {}
     }
 
+    /// Parse pgoutput bytes into WalRecord items. Attaches relation metadata
+    /// where Relation messages were observed earlier in the same payload. The
+    /// parser attempts to attach xid/commit_time/lsn when Begin/Commit are
+    /// present in the payload.
     pub fn parse(&self, wal_data: &Bytes) -> Result<Vec<WalRecord>> {
-        let mut records = Vec::new();
-        self.parse_wal_data(wal_data, &mut records)?;
+        let mut records: Vec<WalRecord> = Vec::new();
+
+        if wal_data.is_empty() {
+            return Ok(records);
+        }
+
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+        let mut relations: HashMap<u32, RelationInfo> = HashMap::new();
+
+        let mut current_xid: u64 = 0;
+        let mut current_commit_time: i64 = 0;
+        let mut current_lsn: u64 = 0;
+
+        // Parse a single message from the provided bytes. In most replication
+        // setups pgwire-replication will hand a single logical message per
+        // payload. The parser currently doesn't expose the consumed offset, so
+        // we parse once and return the records discovered.
+        match parser.parse_wal_message_bytes(wal_data.clone()) {
+            Ok(streaming) => {
+                match streaming.message {
+                    LogicalReplicationMessage::Relation(rel) => {
+                        relations.insert(rel.rel_id(), rel.into());
+                    }
+                    LogicalReplicationMessage::Begin { final_lsn, commit_time_micros, xid } => {
+                        current_lsn = final_lsn;
+                        current_commit_time = commit_time_micros as i64;
+                        current_xid = xid as u64;
+                    }
+                    LogicalReplicationMessage::Commit { flags: _, commit_lsn, commit_time_micros, xid: _ } => {
+                        current_lsn = commit_lsn;
+                        current_commit_time = commit_time_micros as i64;
+                    }
+                    LogicalReplicationMessage::Insert { relation_id, tuple } => {
+                        let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                        let row = tuple_to_rowdata(&tuple, relations.get(&relation_id));
+                        records.push(WalRecord {
+                            lsn: current_lsn,
+                            table_schema: schema,
+                            table_name: name,
+                            operation: Operation::Insert,
+                            oid,
+                            new_tuple: Some(row),
+                            old_tuple: None,
+                            tx_commit_time: current_commit_time,
+                            tx_xid: current_xid,
+                        });
+                    }
+                    LogicalReplicationMessage::Update { relation_id, old_tuple, new_tuple, .. } => {
+                        let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                        let new_row = new_tuple.as_ref().map(|t| tuple_to_rowdata(t, relations.get(&relation_id)));
+                        let old_row = old_tuple.as_ref().map(|t| tuple_to_rowdata(t, relations.get(&relation_id)));
+                        records.push(WalRecord {
+                            lsn: current_lsn,
+                            table_schema: schema,
+                            table_name: name,
+                            operation: Operation::Update,
+                            oid,
+                            new_tuple: new_row,
+                            old_tuple: old_row,
+                            tx_commit_time: current_commit_time,
+                            tx_xid: current_xid,
+                        });
+                    }
+                    LogicalReplicationMessage::Delete { relation_id, old_tuple, .. } => {
+                        let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                        let old_row = old_tuple.as_ref().map(|t| tuple_to_rowdata(t, relations.get(&relation_id)));
+                        records.push(WalRecord {
+                            lsn: current_lsn,
+                            table_schema: schema,
+                            table_name: name,
+                            operation: Operation::Delete,
+                            oid,
+                            new_tuple: None,
+                            old_tuple: old_row,
+                            tx_commit_time: current_commit_time,
+                            tx_xid: current_xid,
+                        });
+                    }
+                    LogicalReplicationMessage::Truncate { relation_ids, .. } => {
+                        for rid in relation_ids {
+                            let (schema, name, oid) = relation_info_for(&relations, rid);
+                            records.push(WalRecord {
+                                lsn: current_lsn,
+                                table_schema: schema.clone(),
+                                table_name: name.clone(),
+                                operation: Operation::Truncate,
+                                oid,
+                                new_tuple: None,
+                                old_tuple: None,
+                                tx_commit_time: current_commit_time,
+                                tx_xid: current_xid,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("pgoutput parse error: {}", e));
+            }
+        }
+
         Ok(records)
     }
+}
 
-    fn parse_wal_data(&self, wal_data: &Bytes, records: &mut Vec<WalRecord>) -> Result<()> {
-        let mut offset = 0;
-        while offset < wal_data.len() {
-            let (consumed, rec) = self.parse_single_record(&wal_data[offset..])?;
-            if let Some(rec) = rec {
-                records.push(rec);
+fn relation_info_for(relations: &HashMap<u32, RelationInfo>, relid: u32) -> (String, String, u32) {
+    if let Some(rel) = relations.get(&relid) {
+        (
+            rel.namespace().unwrap_or("public").to_string(),
+            rel.name().to_string(),
+            rel.rel_id(),
+        )
+    } else {
+        ("public".to_string(), relid.to_string(), relid)
+    }
+}
+
+fn tuple_to_rowdata(tuple: &TupleData, relation: Option<&RelationInfo>) -> RowData {
+    let mut cols: Vec<Column> = Vec::new();
+
+    for (idx, col) in tuple.columns().iter().enumerate() {
+        let (name, type_oid) = if let Some(rel) = relation {
+            if let Some(cinfo) = rel.columns().get(idx) {
+                (cinfo.name().to_string(), cinfo.type_oid())
+            } else {
+                (format!("col{}", idx + 1), 0)
             }
-            offset += consumed;
-        }
-        Ok(())
-    }
-
-    fn parse_single_record(&self, data: &[u8]) -> Result<(usize, Option<WalRecord>)> {
-        if data.len() < 4 {
-            return Ok((data.len(), None));
-        }
-
-        let msg_type = data[0];
-        match msg_type {
-            b'W' | b'I' | b'U' | b'D' | b'T' => self.parse_logical_decoded(data),
-            b'B' => Ok((5, None)),
-            _ => Ok((data.len(), None)),
-        }
-    }
-
-    fn parse_logical_decoded(&self, data: &[u8]) -> Result<(usize, Option<WalRecord>)> {
-        if data.len() < 25 {
-            return Ok((0, None));
-        }
-
-        let lsn = u64::from_be_bytes([
-            data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-        ]);
-        let tx_xid = u64::from_be_bytes([
-            data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
-        ]);
-        let tx_commit_time = i64::from_be_bytes([
-            data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
-        ]);
-
-        let remaining = &data[25..];
-        let mut pos = 0;
-
-        let (table_schema, consumed) = self.read_cstring(remaining)?;
-        pos += consumed;
-
-        let (table_name, consumed) = self.read_cstring(&remaining[pos..])?;
-        pos += consumed;
-
-        let operation = match data[0] {
-            b'I' => Operation::Insert,
-            b'U' => Operation::Update,
-            b'D' => Operation::Delete,
-            b'T' => Operation::Truncate,
-            _ => return Ok((pos + 25, None)),
-        };
-
-        let oid = if remaining.len() > pos + 4 {
-            u32::from_be_bytes([
-                remaining[pos],
-                remaining[pos + 1],
-                remaining[pos + 2],
-                remaining[pos + 3],
-            ])
         } else {
-            0
+            (format!("col{}", idx + 1), 0)
         };
 
-        Ok((
-            pos + 25,
-            Some(WalRecord {
-                lsn,
-                table_schema,
-                table_name,
-                operation,
-                oid,
-                new_tuple: None,
-                old_tuple: None,
-                tx_commit_time,
-                tx_xid,
-            }),
-        ))
+        let (value, is_null) = match col {
+            ColumnData::Null => (None, true),
+            ColumnData::Text(t) => (Some(ColumnValue::String(t.clone())), false),
+            ColumnData::Binary(b) => (Some(ColumnValue::Bytes(b.clone())), false),
+            ColumnData::Int16(v) => (Some(ColumnValue::Integer(*v as i64)), false),
+            ColumnData::Int32(v) => (Some(ColumnValue::Integer(*v as i64)), false),
+            ColumnData::Int64(v) => (Some(ColumnValue::Integer(*v)), false),
+            ColumnData::Float32(v) => (Some(ColumnValue::Float(*v as f64)), false),
+            ColumnData::Float64(v) => (Some(ColumnValue::Float(*v)), false),
+            ColumnData::Bool(v) => (Some(ColumnValue::Boolean(*v)), false),
+            ColumnData::Json(j) => (Some(ColumnValue::Json(j.clone())), false),
+            ColumnData::Other(s) => (Some(ColumnValue::String(s.clone())), false),
+        };
+
+        cols.push(Column {
+            name,
+            type_oid,
+            value,
+            is_null,
+        });
     }
 
-    fn read_cstring(&self, data: &[u8]) -> Result<(String, usize)> {
-        let end = data
-            .iter()
-            .position(|&b| b == 0)
-            .context("Missing null terminator")?;
-        let s = String::from_utf8_lossy(&data[..end]).to_string();
-        Ok((s, end + 1))
-    }
-
-    #[allow(dead_code)]
-    pub fn decode_tuple(&self, data: &[u8], type_oids: &[u32]) -> Result<RowData> {
-        let mut columns = Vec::new();
-        let mut offset = 0;
-
-        for &type_oid in type_oids {
-            let (value, consumed) = self.decode_column(data, offset, type_oid)?;
-            offset += consumed;
-            columns.push(Column {
-                name: String::new(),
-                type_oid,
-                value: value.clone(),
-                is_null: value.is_none(),
-            });
-        }
-
-        Ok(RowData { columns })
-    }
-
-    #[allow(dead_code)]
-    fn decode_column(
-        &self,
-        data: &[u8],
-        offset: usize,
-        type_oid: u32,
-    ) -> Result<(Option<ColumnValue>, usize)> {
-        if offset >= data.len() {
-            return Ok((None, 0));
-        }
-
-        let null_flag = data[offset];
-        if null_flag == b'N' {
-            return Ok((None, 1));
-        }
-
-        let is_toasted = null_flag == b't';
-        let value_data = &data[offset + 1..];
-
-        let value = (self.decode_datum)(type_oid, value_data, is_toasted).ok();
-        let consumed = 1 + value_data.len();
-
-        Ok((value, consumed))
-    }
+    RowData { columns: cols }
 }
 
 impl Default for WalParser {
