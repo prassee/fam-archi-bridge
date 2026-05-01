@@ -114,3 +114,9 @@ kubectl apply -f k8s/kafka.yaml
    - Make Metrics shared (Arc) so counters are updated across tasks, remove unused imports, and silence remaining warnings. Add more unit tests for metrics and decoder behaviour.
 
 If you want I can implement these steps in order. Stopping now as requested.
+
+## Recent Work
+
+- Implemented low-level BufferReader-based WAL parser using pg_walstream buffer primitives. The parser now fully consumes multiple logical messages from a single Bytes payload and decodes Relation/Begin/Commit/Insert/Update/Delete/Truncate into WalRecord entries with named columns and transaction metadata when available.
+- Added fixtures-based unit tests: tests/wal_parser_fixtures.rs builds a Relation + Insert + Update + Delete payload and asserts the parser decodes the expected records. The test suite was run locally and the fixture test passed.
+- Notes: temporary debug output remains in the parser (eprintln!) to aid verification and there is a minor unused-import warning in decoder.rs. These are planned cleanup tasks.
