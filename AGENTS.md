@@ -97,3 +97,7 @@ kubectl apply -f k8s/kafka.yaml
 - Custom WAL parser for decoding replication messages
 - Kafka producer with configurable batch settings
 - Sub-second latency via 10ms poll interval
+- Uses PostgreSQL logical replication via `pgwire-replication` (streaming) and `pg_walstream` for pgoutput parsing
+- WAL parser implemented with pg_walstream: decodes Relation/Begin/Commit/Insert/Update/Delete/Truncate messages, caches relation metadata, maps tuple columns to named columns and attaches transaction metadata when available
+- Unit test added: tests/wal_parser_tests.rs (basic empty payload test). More fixtures can be added using pg_walstream helpers
+- Note: building pg_walstream requires libpq headers on some systems. On macOS install libpq via Homebrew: `brew install libpq && brew link --force libpq`
