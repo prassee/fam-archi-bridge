@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-use pg_walstream::LogicalReplicationParser;
-use pg_walstream::LogicalReplicationMessage;
-use pg_walstream::TupleData;
+use pg_walstream::BufferReader;
 use pg_walstream::RelationInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,119 +82,150 @@ impl WalParser {
             return Ok(records);
         }
 
-        let mut parser = LogicalReplicationParser::with_protocol_version(1);
         let mut relations: HashMap<u32, RelationInfo> = HashMap::new();
 
         let mut current_xid: u64 = 0;
         let mut current_commit_time: i64 = 0;
         let mut current_lsn: u64 = 0;
 
-        // Parse messages repeatedly from the provided bytes. The parser works
-        // with a BufferReader internally — to iterate multiple messages we use
-        // BufferReader by creating a copy and repeatedly parsing from the
-        // remaining slice. The parse_wal_message_bytes helper expects a Bytes
-        // value; we emulate streaming by slicing the Bytes as we consume data.
-        let mut buf = wal_data.clone();
-        loop {
-            if buf.is_empty() {
-                break;
-            }
+        // Use a BufferReader directly to iterate all messages contained in the
+        // Bytes payload. This consumes messages sequentially until we've read
+        // the entire buffer.
+        let mut reader = BufferReader::from_bytes(wal_data.clone());
 
-            match parser.parse_wal_message_bytes(buf.clone()) {
-                Ok(streaming) => {
-                    match streaming.message {
-                        LogicalReplicationMessage::Relation { relation_id, namespace, relation_name, replica_identity, columns } => {
-                            let rel = RelationInfo::new(relation_id, namespace, relation_name, replica_identity, columns);
-                            relations.insert(relation_id, rel);
-                        }
-                        LogicalReplicationMessage::Begin { final_lsn, timestamp, xid } => {
-                            current_lsn = final_lsn;
-                            current_commit_time = timestamp as i64;
-                            current_xid = xid as u64;
-                        }
-                        LogicalReplicationMessage::Commit { flags: _, commit_lsn, end_lsn: _, timestamp } => {
-                            current_lsn = commit_lsn;
-                            current_commit_time = timestamp as i64;
-                        }
-                        LogicalReplicationMessage::Insert { relation_id, tuple } => {
-                            let (schema, name, oid) = relation_info_for(&relations, relation_id);
-                            let row = tuple_to_rowdata(&tuple, relations.get(&relation_id));
-                            records.push(WalRecord {
-                                lsn: current_lsn,
-                                table_schema: schema,
-                                table_name: name,
-                                operation: Operation::Insert,
-                                oid,
-                                new_tuple: Some(row),
-                                old_tuple: None,
-                                tx_commit_time: current_commit_time,
-                                tx_xid: current_xid,
-                            });
-                        }
-                        LogicalReplicationMessage::Update { relation_id, old_tuple, new_tuple, .. } => {
-                            let (schema, name, oid) = relation_info_for(&relations, relation_id);
-                            let new_row = Some(tuple_to_rowdata(&new_tuple, relations.get(&relation_id)));
-                            let old_row = old_tuple.as_ref().map(|t| tuple_to_rowdata(t, relations.get(&relation_id)));
-                            records.push(WalRecord {
-                                lsn: current_lsn,
-                                table_schema: schema,
-                                table_name: name,
-                                operation: Operation::Update,
-                                oid,
-                                new_tuple: new_row,
-                                old_tuple: old_row,
-                                tx_commit_time: current_commit_time,
-                                tx_xid: current_xid,
-                            });
-                        }
-                        LogicalReplicationMessage::Delete { relation_id, old_tuple, .. } => {
-                            let (schema, name, oid) = relation_info_for(&relations, relation_id);
-                            let old_row = Some(tuple_to_rowdata(&old_tuple, relations.get(&relation_id)));
-                            records.push(WalRecord {
-                                lsn: current_lsn,
-                                table_schema: schema,
-                                table_name: name,
-                                operation: Operation::Delete,
-                                oid,
-                                new_tuple: None,
-                                old_tuple: old_row,
-                                tx_commit_time: current_commit_time,
-                                tx_xid: current_xid,
-                            });
-                        }
-                        LogicalReplicationMessage::Truncate { relation_ids, .. } => {
-                            for rid in relation_ids {
-                                let (schema, name, oid) = relation_info_for(&relations, rid);
-                                records.push(WalRecord {
-                                    lsn: current_lsn,
-                                    table_schema: schema.clone(),
-                                    table_name: name.clone(),
-                                    operation: Operation::Truncate,
-                                    oid,
-                                    new_tuple: None,
-                                    old_tuple: None,
-                                    tx_commit_time: current_commit_time,
-                                    tx_xid: current_xid,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
+        while reader.remaining() > 0 {
+            let msg_type = match reader.read_u8() {
+                Ok(b) => b as char,
+                Err(e) => return Err(anyhow::anyhow!("buffer read error: {}", e)),
+            };
 
-                    // The parser consumes from the start of the Bytes but does
-                    // not expose how many bytes were consumed. The streaming
-                    // helper (BufferReader) places the remaining unread bytes in
-                    // reader; however parse_wal_message_bytes hides that. To
-                    // advance we detect whether there are more messages by
-                    // attempting to parse the remainder using the internal
-                    // streaming flag. Practically, replication sends single
-                    // messages per payload so we break after the first one.
-                    // If multi-message payloads are required, we should use the
-                    // lower-level BufferReader API directly. For now break.
-                    break;
+            match msg_type {
+                'B' => {
+                    let final_lsn = reader.read_u64()?;
+                    let timestamp = reader.read_i64()?;
+                    let xid = reader.read_u32()?;
+                    current_lsn = final_lsn;
+                    current_commit_time = timestamp as i64;
+                    current_xid = xid as u64;
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("pgoutput parse error: {}", e));
+                'C' => {
+                    let _flags = reader.read_u8()?;
+                    let commit_lsn = reader.read_u64()?;
+                    let _end_lsn = reader.read_u64()?;
+                    let timestamp = reader.read_i64()?;
+                    current_lsn = commit_lsn;
+                    current_commit_time = timestamp as i64;
+                }
+                'R' => {
+                    let relation_id = reader.read_u32()?;
+                    let namespace = reader.read_cstring()?;
+                    let relation_name = reader.read_cstring()?;
+                    let replica_identity = reader.read_u8()?;
+                    let column_count = reader.read_u16()? as usize;
+
+                    let mut columns = Vec::with_capacity(column_count);
+                    for _ in 0..column_count {
+                        let flags = reader.read_u8()?;
+                        let name = reader.read_cstring()?;
+                        let type_id = reader.read_u32()?;
+                        let type_modifier = reader.read_i32()?;
+                        // ColumnInfo is internal to pg_walstream::protocol; we
+                        // reuse RelationInfo via its public constructor that
+                        // accepts ColumnInfo (the types are exported). Build a
+                        // ColumnInfo compatible struct using the public type.
+                        columns.push(pg_walstream::ColumnInfo::new(flags, name, type_id, type_modifier));
+                    }
+                    let rel = RelationInfo::new(relation_id, namespace, relation_name, replica_identity, columns);
+                    relations.insert(relation_id, rel);
+                }
+                'I' => {
+                    let relation_id = reader.read_u32()?;
+                    let tuple_type = reader.read_u8()? as char;
+                    if tuple_type != 'N' {
+                        return Err(anyhow::anyhow!("unexpected tuple type in INSERT: {}", tuple_type));
+                    }
+                    let row = parse_tuple_to_row(&mut reader, relations.get(&relation_id))?;
+                    let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                    records.push(WalRecord {
+                        lsn: current_lsn,
+                        table_schema: schema,
+                        table_name: name,
+                        operation: Operation::Insert,
+                        oid,
+                        new_tuple: Some(row),
+                        old_tuple: None,
+                        tx_commit_time: current_commit_time,
+                        tx_xid: current_xid,
+                    });
+                }
+                'U' => {
+                    let relation_id = reader.read_u32()?;
+                    // optional old tuple
+                    let mut old_row: Option<RowData> = None;
+                    if reader.remaining() > 0 {
+                        let peek = reader.peek_u8()? as char;
+                        if peek == 'K' || peek == 'O' {
+                            let _ = reader.read_u8()?; // consume type
+                            old_row = Some(parse_tuple_to_row(&mut reader, relations.get(&relation_id))?);
+                        }
+                    }
+                    let new_tuple_type = reader.read_u8()? as char;
+                    if new_tuple_type != 'N' {
+                        return Err(anyhow::anyhow!("unexpected new tuple type in UPDATE: {}", new_tuple_type));
+                    }
+                    let new_row = parse_tuple_to_row(&mut reader, relations.get(&relation_id))?;
+                    let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                    records.push(WalRecord {
+                        lsn: current_lsn,
+                        table_schema: schema,
+                        table_name: name,
+                        operation: Operation::Update,
+                        oid,
+                        new_tuple: Some(new_row),
+                        old_tuple: old_row,
+                        tx_commit_time: current_commit_time,
+                        tx_xid: current_xid,
+                    });
+                }
+                'D' => {
+                    let relation_id = reader.read_u32()?;
+                    let _key_type = reader.read_u8()? as char;
+                    let old_row = parse_tuple_to_row(&mut reader, relations.get(&relation_id))?;
+                    let (schema, name, oid) = relation_info_for(&relations, relation_id);
+                    records.push(WalRecord {
+                        lsn: current_lsn,
+                        table_schema: schema,
+                        table_name: name,
+                        operation: Operation::Delete,
+                        oid,
+                        new_tuple: None,
+                        old_tuple: Some(old_row),
+                        tx_commit_time: current_commit_time,
+                        tx_xid: current_xid,
+                    });
+                }
+                'T' => {
+                    let relation_count = reader.read_u32()?;
+                    let _flags = reader.read_u8()?;
+                    for _ in 0..relation_count {
+                        let rid = reader.read_u32()?;
+                        let (schema, name, oid) = relation_info_for(&relations, rid);
+                        records.push(WalRecord {
+                            lsn: current_lsn,
+                            table_schema: schema.clone(),
+                            table_name: name.clone(),
+                            operation: Operation::Truncate,
+                            oid,
+                            new_tuple: None,
+                            old_tuple: None,
+                            tx_commit_time: current_commit_time,
+                            tx_xid: current_xid,
+                        });
+                    }
+                }
+                _ => {
+                    // Unknown/unsupported message type: best-effort skip or break
+                    break;
                 }
             }
         }
@@ -217,35 +246,83 @@ fn relation_info_for(relations: &HashMap<u32, RelationInfo>, relid: u32) -> (Str
     }
 }
 
-fn tuple_to_rowdata(tuple: &TupleData, relation: Option<&RelationInfo>) -> RowData {
-    let mut cols: Vec<Column> = Vec::new();
+// tuple_to_rowdata removed - parser now uses parse_tuple_to_row(reader, relation)
 
-    for (idx, col) in tuple.columns.iter().enumerate() {
-        let (name, type_oid) = if let Some(rel) = relation {
-            if let Some(cinfo) = rel.get_column_by_index(idx) {
-                (cinfo.name.to_string(), cinfo.type_id)
-            } else {
-                (format!("col{}", idx + 1), 0)
+fn parse_tuple_to_row(reader: &mut BufferReader, relation: Option<&RelationInfo>) -> Result<RowData> {
+    // mirror parse_tuple_data logic from pg_walstream::protocol
+    let column_count = reader.read_u16()? as usize;
+    let mut cols: Vec<Column> = Vec::with_capacity(column_count);
+
+    for idx in 0..column_count {
+        let column_type = reader.read_u8()? as char;
+
+        let (value, is_null, name, type_oid) = match column_type {
+            'n' => (
+                None,
+                true,
+                relation
+                    .and_then(|r| r.get_column_by_index(idx).map(|c| c.name.to_string()))
+                    .unwrap_or_else(|| format!("col{}", idx + 1)),
+                relation
+                    .and_then(|r| r.get_column_by_index(idx).map(|c| c.type_id))
+                    .unwrap_or(0),
+            ),
+            'u' => (
+                None,
+                false,
+                relation
+                    .and_then(|r| r.get_column_by_index(idx).map(|c| c.name.to_string()))
+                    .unwrap_or_else(|| format!("col{}", idx + 1)),
+                relation
+                    .and_then(|r| r.get_column_by_index(idx).map(|c| c.type_id))
+                    .unwrap_or(0),
+            ),
+            't' => {
+                let length = reader.read_u32()? as usize;
+                let data = reader.read_bytes_buf(length)?;
+                let s = match std::str::from_utf8(data.as_ref()) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => String::from_utf8_lossy(data.as_ref()).into_owned(),
+                };
+                (
+                    Some(ColumnValue::String(s)),
+                    false,
+                    relation
+                        .and_then(|r| r.get_column_by_index(idx).map(|c| c.name.to_string()))
+                        .unwrap_or_else(|| format!("col{}", idx + 1)),
+                    relation
+                        .and_then(|r| r.get_column_by_index(idx).map(|c| c.type_id))
+                        .unwrap_or(0),
+                )
             }
-        } else {
-            (format!("col{}", idx + 1), 0)
+            'b' => {
+                let length = reader.read_u32()? as usize;
+                let data = reader.read_bytes_buf(length)?;
+                (
+                    Some(ColumnValue::Bytes(data.to_vec())),
+                    false,
+                    relation
+                        .and_then(|r| r.get_column_by_index(idx).map(|c| c.name.to_string()))
+                        .unwrap_or_else(|| format!("col{}", idx + 1)),
+                    relation
+                        .and_then(|r| r.get_column_by_index(idx).map(|c| c.type_id))
+                        .unwrap_or(0),
+                )
+            }
+            other => {
+                return Err(anyhow::anyhow!("Unknown column data type: {}", other));
+            }
         };
 
-        let (value, is_null) = if col.is_null() {
-            (None, true)
-        } else if col.is_text() {
-            (col.as_string().map(ColumnValue::String), false)
-        } else if col.is_binary() {
-            (Some(ColumnValue::Bytes(col.raw_bytes().to_vec())), false)
-        } else {
-            // Fallback to string if possible
-            (col.as_string().map(ColumnValue::String), false)
-        };
-
-        cols.push(Column { name, type_oid, value, is_null });
+        cols.push(Column {
+            name,
+            type_oid,
+            value,
+            is_null,
+        });
     }
 
-    RowData { columns: cols }
+    Ok(RowData { columns: cols })
 }
 
 impl Default for WalParser {
