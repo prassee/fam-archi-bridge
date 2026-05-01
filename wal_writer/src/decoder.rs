@@ -6,7 +6,7 @@ use tracing::{debug, error};
 
 use crate::kafka::KafkaProducer;
 use crate::metrics::Metrics;
-use crate::wal_parser::{WalRecord, WalParser};
+use crate::wal_parser::WalRecord;
 
 #[derive(Clone)]
 pub struct WalDecoder {

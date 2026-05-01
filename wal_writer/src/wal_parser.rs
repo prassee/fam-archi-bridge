@@ -94,7 +94,6 @@ impl WalParser {
         let mut reader = BufferReader::from_bytes(wal_data.clone());
 
         while reader.remaining() > 0 {
-            eprintln!("parser: remaining_before_msg={}", reader.remaining());
             let msg_type = match reader.read_u8() {
                 Ok(b) => b as char,
                 Err(e) => return Err(anyhow::anyhow!("buffer read error: {}", e)),
@@ -247,19 +246,16 @@ fn relation_info_for(relations: &HashMap<u32, RelationInfo>, relid: u32) -> (Str
     }
 }
 
-// tuple_to_rowdata removed - parser now uses parse_tuple_to_row(reader, relation)
+    // tuple_to_rowdata removed - parser now uses parse_tuple_to_row(reader, relation)
 
 fn parse_tuple_to_row(reader: &mut BufferReader, relation: Option<&RelationInfo>) -> Result<RowData> {
     // mirror parse_tuple_data logic from pg_walstream::protocol
-    eprintln!("parse_tuple_to_row: remaining_before_column_count={}", reader.remaining());
     let column_count = reader.read_u16()? as usize;
-    eprintln!("parse_tuple_to_row: column_count={}", column_count);
     let mut cols: Vec<Column> = Vec::with_capacity(column_count);
 
     for idx in 0..column_count {
-        eprintln!("parse_tuple_to_row: remaining_before_column_read={}", reader.remaining());
         let column_type = reader.read_u8()? as char;
-        eprintln!("parse_tuple_to_row: idx={} column_type='{}' remaining_after_type={}", idx, column_type, reader.remaining());
+        // column_type is one of 'n'|'u'|'t'|'b' per pgoutput tuple protocol
 
         let (value, is_null, name, type_oid) = match column_type {
             'n' => (
@@ -284,7 +280,6 @@ fn parse_tuple_to_row(reader: &mut BufferReader, relation: Option<&RelationInfo>
             ),
             't' => {
                 let length = reader.read_u32()? as usize;
-                eprintln!("parse_tuple_to_row: text length={} remaining_after_len={}", length, reader.remaining());
                 let data = reader.read_bytes_buf(length)?;
                 let s = match std::str::from_utf8(data.as_ref()) {
                     Ok(v) => v.to_string(),
@@ -303,7 +298,6 @@ fn parse_tuple_to_row(reader: &mut BufferReader, relation: Option<&RelationInfo>
             }
             'b' => {
                 let length = reader.read_u32()? as usize;
-                eprintln!("parse_tuple_to_row: binary length={} remaining_after_len={}", length, reader.remaining());
                 let data = reader.read_bytes_buf(length)?;
                 (
                     Some(ColumnValue::Bytes(data.to_vec())),

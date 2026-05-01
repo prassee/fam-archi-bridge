@@ -2,6 +2,42 @@
 
 High-throughput CDC capture from PostgreSQL WAL with sub-second latency, designed for PhonePe scale.
 
+## Project Structure
+
+```
+rust-wal-cake-writer/
+├── AGENTS.md                 # This file
+├── .gitignore
+├── k8s/                      # Kubernetes manifests
+│   ├── configmap.yaml
+│   ├── deployment.yaml
+│   ├── kafka.yaml
+│   ├── kustomization.yaml
+│   ├── postgres.yaml
+│   └── rbac.yaml
+├── data_pump/                # Python data pump utility
+│   ├── main.py
+│   ├── pyproject.toml
+│   ├── README.md
+│   └── .python-version
+└── wal_writer/               # Main Rust project
+    ├── Cargo.toml
+    ├── Cargo.lock
+    ├── src/
+    │   ├── main.rs           # Entry point
+    │   ├── lib.rs            # Library root
+    │   ├── config.rs         # Configuration from env vars
+    │   ├── decoder.rs        # Kafka message encoding
+    │   ├── kafka.rs          # Kafka producer
+    │   ├── metrics.rs        # Prometheus metrics
+    │   ├── pg_replication.rs # PostgreSQL replication
+    │   ├── state.rs          # State persistence
+    │   └── wal_parser.rs     # WAL message parser
+    └── tests/
+        ├── wal_parser_tests.rs
+        └── wal_parser_fixtures.rs
+```
+
 ## Build
 
 ```bash
