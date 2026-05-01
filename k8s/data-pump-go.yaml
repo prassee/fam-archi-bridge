@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-pump-go
+  namespace: cdc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-pump-go
+  template:
+    metadata:
+      labels:
+        app: data-pump-go
+    spec:
+      containers:
+      - name: data-pump-go
+        image: data-pump-go:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_HOST
+          value: postgres.cdc.svc.cluster.local
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_USER
+          value: postgres
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wal-writer-secret
+              key: WAL_WRITER_PG_PASSWORD
+        - name: DB_NAME
+          value: postgres
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      restartPolicy: Always

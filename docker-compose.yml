@@ -68,6 +68,27 @@ services:
     restart: unless-stopped
     # Resource hints (K8s requests: 500m CPU, 1Gi memory; limits: 1000m CPU, 2Gi memory)
 
+  # Data Pump Go service - UPI transaction generator
+  # Equivalent to data_pump Python project but written in Go
+  data-pump-go:
+    image: data-pump-go:latest
+    container_name: data-pump-go
+    build:
+      context: ./data_pump_go
+      dockerfile: Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # Note: This service generates UPI transaction data for testing
+    # It continuously inserts data at ~10,000 txns/sec
+
   # WAL Writer service
   # Derived from k8s/deployment.yaml and k8s/configmap.yaml
   wal-writer:

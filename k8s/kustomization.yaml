@@ -8,10 +8,10 @@ resources:
   - postgres.yaml
   - kafka.yaml
   - deployment.yaml
+  - data-pump-go.yaml
 
 labels:
-  - includeSelectors: true
-    pairs:
+  - pairs:
       app: wal-writer
 
 configMapGenerator:

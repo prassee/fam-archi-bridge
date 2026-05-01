@@ -120,7 +120,8 @@ func createTable(ctx context.Context, pool *pgxpool.Pool) error {
 			refund_amount DECIMAL(15,2),
 			merchant_id VARCHAR(50),
 			terminal_id VARCHAR(50),
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP
 		)
 	`)
 	return err
@@ -219,6 +220,13 @@ func randomChoice(options []string) string {
 	return options[rand.Intn(len(options))]
 }
 
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 func insertBatch(ctx context.Context, pool *pgxpool.Pool, batch []Transaction) int {
 	if len(batch) == 0 {
 		return 0
@@ -271,6 +279,7 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	interval := float64(batchSize) / float64(targetPerSec)
 
 	var totalInserted atomic.Int64
+	var totalUpdated atomic.Int64
 	startTime := time.Now()
 
 	workChan := make(chan []Transaction, numWorkers)
@@ -287,7 +296,25 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 		}()
 	}
 
+	// Start update goroutine - updates 4000-8000 random records every 1 minute
+	updateTicker := time.NewTicker(1 * time.Minute)
+	defer updateTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-updateTicker.C:
+				numUpdates := rand.Intn(4001) + 4000 // 4000 to 8000
+				updated := updateRandomRecords(ctx, pool, numUpdates)
+				totalUpdated.Add(int64(updated))
+				fmt.Printf("Updated %d random records (total updates: %d)\n", updated, totalUpdated.Load())
+			}
+		}
+	}()
+
 	fmt.Printf("Table created. Generating %d txns/sec continuously...\n", targetPerSec)
+	fmt.Println("Random updates of 4000-8000 records will run every 1 minute")
 
 	ticker := time.NewTicker(time.Duration(interval*1000) * time.Millisecond)
 	defer ticker.Stop()
@@ -300,6 +327,7 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 			elapsed := time.Since(startTime).Seconds()
 			fmt.Printf("\nInserted %d transactions in %.2fs (%.0f txns/sec)\n",
 				totalInserted.Load(), elapsed, float64(totalInserted.Load())/elapsed)
+			fmt.Printf("Total records updated: %d\n", totalUpdated.Load())
 			return
 		case <-ticker.C:
 			batch := make([]Transaction, batchSize)
@@ -311,6 +339,66 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
+func updateRandomRecords(ctx context.Context, pool *pgxpool.Pool, count int) int {
+	// Get random transaction IDs to update
+	rows, err := pool.Query(ctx, `
+		SELECT transaction_id FROM upi_transactions
+		ORDER BY random()
+		LIMIT $1
+	`, count)
+	if err != nil {
+		fmt.Printf("Failed to get random transaction IDs: %v\n", err)
+		return 0
+	}
+	defer rows.Close()
+
+	var txnIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			fmt.Printf("Failed to scan transaction ID: %v\n", err)
+			continue
+		}
+		txnIDs = append(txnIDs, id)
+	}
+
+	if len(txnIDs) == 0 {
+		return 0
+	}
+
+	// Generate update data for each transaction
+	now := time.Now()
+	updated := 0
+
+	for _, id := range txnIDs {
+		status := randomChoice([]string{"SUCCESS", "FAILED", "PENDING"})
+		settlementStatus := randomChoice([]string{"SETTLED", "PENDING", "FAILED"})
+		refundStatus := randomChoice([]string{"NONE", "INITIATED", "COMPLETED"})
+
+		_, err := pool.Exec(ctx, `
+			UPDATE upi_transactions
+			SET status = $1,
+				settlement_status = $2,
+				refund_status = $3,
+				amount = $4,
+				transaction_timestamp = $5,
+				updated_at = $6
+			WHERE transaction_id = $7
+		`, status, settlementStatus, refundStatus,
+			round(rand.Float64()*100000+10, 2),
+			now.Add(-time.Duration(rand.Intn(86400))*time.Second),
+			now, id)
+
+		if err != nil {
+			fmt.Printf("Failed to update transaction %s: %v\n", id, err)
+			continue
+		}
+		updated++
+	}
+
+	return updated
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -318,7 +406,15 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
 
-	pool, err := pgxpool.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres")
+	// Read database config from environment variables
+	dbHost := getEnv("DB_HOST", "localhost")
+	dbPort := getEnv("DB_PORT", "5432")
+	dbUser := getEnv("DB_USER", "postgres")
+	dbPassword := getEnv("DB_PASSWORD", "postgres")
+	dbName := getEnv("DB_NAME", "postgres")
+
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPassword, dbHost, dbPort, dbName)
+	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		return

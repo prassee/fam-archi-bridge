@@ -11,21 +11,18 @@ rust-wal-cake-writer/
 ├── docker-compose.yml        # Local development setup
 ├── k8s/                      # Kubernetes manifests
 │   ├── configmap.yaml
+│   ├── data-pump-go.yaml   # Go data pump deployment
 │   ├── deployment.yaml
 │   ├── kafka.yaml
 │   ├── kustomization.yaml
 │   ├── namespace.yaml
 │   ├── postgres.yaml
 │   └── rbac.yaml
-├── data_pump/                 # Python data pump utility
-│   ├── main.py
-│   ├── pyproject.toml
-│   ├── README.md
-│   └── .python-version
-├── data_pump_go/             # Go data pump utility (equivalent to Python version)
+├── data_pump_go/             # Go data pump utility (UPI transaction generator)
 │   ├── main.go
 │   ├── go.mod
 │   ├── go.sum
+│   ├── Dockerfile
 │   └── README.md
 └── wal_writer/               # Main Rust project
     ├── Cargo.toml
