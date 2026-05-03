@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio::signal;
 use tracing::{error, info};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod decoder;
@@ -35,16 +35,14 @@ async fn main() -> Result<()> {
 
     let kafka_producer = Arc::new(kafka::KafkaProducer::new(&config)?);
 
-    let mut wal_reader = pg_replication::WalReader::new(
-        config.clone(),
-        kafka_producer,
-        metrics,
-    );
+    let mut wal_reader =
+        pg_replication::WalReader::new(config.clone(), kafka_producer.clone(), metrics);
 
     tokio::select! {
         result = wal_reader.run() => {
             if let Err(e) = result {
                 error!("Wal reader error: {}", e);
+                kafka_producer.flush();
                 std::process::exit(1);
             }
         }
@@ -53,16 +51,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!("Flushing pending Kafka messages before shutdown");
+    kafka_producer.flush();
     info!("Shutdown complete");
     Ok(())
 }
 
 fn setup_logging(config: &AppConfig) -> Result<()> {
-    let file_appender = RollingFileAppender::new(
-        Rotation::DAILY,
-        &config.logging.directory,
-        "wal-writer.log",
-    );
+    let file_appender =
+        RollingFileAppender::new(Rotation::DAILY, &config.logging.directory, "wal-writer.log");
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 

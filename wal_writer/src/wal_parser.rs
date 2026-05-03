@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use anyhow::Result;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

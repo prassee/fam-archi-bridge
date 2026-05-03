@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for data_pump_go
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache build-base git

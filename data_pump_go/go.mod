@@ -1,6 +1,6 @@
 module data_pump_go
 
-go 1.26.1
+go 1.26
 
 require (
 	github.com/brianvoe/gofakeit/v7 v7.14.1

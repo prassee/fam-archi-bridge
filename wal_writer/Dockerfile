@@ -2,14 +2,20 @@
 # Derived from K8s deployment requirements
 
 # Stage 1: Build
-FROM rust:1.75-alpine AS builder
+FROM rust:1.88 AS builder
 
 # Install build dependencies
-RUN apk add --no-cache \
-    build-base \
-    pkgconfig \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    clang \
+    libclang-dev \
+    pkg-config \
     libpq-dev \
-    openssl-dev
+    libcurl4-openssl-dev \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -32,13 +38,14 @@ RUN cargo build --release && \
     strip /app/target/release/rust-wal-cake-writer
 
 # Stage 2: Runtime
-FROM alpine:3.19
+FROM debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apk add --no-cache \
-    libpq \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
     ca-certificates \
-    curl
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

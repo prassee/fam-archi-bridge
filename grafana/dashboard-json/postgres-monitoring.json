@@ -1,0 +1,189 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "title": "PostgreSQL Status",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pg_up",
+          "legendFormat": "PostgreSQL Up"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "title": "Number of Connections",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pg_stat_activity_count",
+          "legendFormat": "Active Connections"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      }
+    },
+    {
+      "title": "WAL Size (GB)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(pg_wal_size_bytes) / 1073741824",
+          "legendFormat": "WAL Size"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "gbytes"
+        }
+      }
+    },
+    {
+      "title": "Replication Slots",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pg_replication_slot_slot_is_active{slot_name=\"wal_writer_slot\"}",
+          "legendFormat": "wal_writer_slot active"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 12
+      }
+    },
+    {
+      "title": "Slot Lag (GB)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(pg_replication_slots_pg_wal_lsn_diff{slot_name=\"wal_writer_slot\"}) / 1073741824",
+          "legendFormat": "wal_writer_slot"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "gbytes"
+        }
+      }
+    },
+    {
+      "title": "Slot LSN Position (bytes)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pg_replication_slot_slot_confirmed_flush_lsn{slot_name=\"wal_writer_slot\"}",
+          "legendFormat": "confirmed_flush_lsn"
+        },
+        {
+          "expr": "pg_replication_slot_slot_current_wal_lsn{slot_name=\"wal_writer_slot\"}",
+          "legendFormat": "current_wal_lsn"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      }
+    },
+    {
+      "title": "WAL Sender LSN Diff (bytes)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pg_stat_replication_pg_wal_lsn_diff{application_name=\"pgwire-replication\"}",
+          "legendFormat": "pgwire-replication"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 12
+      }
+    },
+    {
+      "title": "Replication Stream State",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pg_replication_slots_active{slot_name=\"wal_writer_slot\"}",
+          "legendFormat": "slot_active"
+        },
+        {
+          "expr": "pg_replication_slot_wal_status{slot_name=\"wal_writer_slot\", wal_status=\"reserved\"}",
+          "legendFormat": "wal_status_reserved"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      }
+    },
+    {
+      "title": "Database Size (GB)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(pg_database_size_bytes{datname!~\"template.*\"}) / 1073741824",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "gbytes"
+        }
+      }
+    }
+  ],
+  "schemaVersion": 38,
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "title": "PostgreSQL Monitoring",
+  "uid": "postgres-monitoring"
+}

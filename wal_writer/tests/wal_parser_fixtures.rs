@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rust_wal_cake_writer::wal_parser::WalParser;
+use rust_wal_cake_writer::wal_parser::{Operation, WalParser};
 
 #[test]
 fn parse_insert_update_delete_roundtrip() {
@@ -74,4 +74,51 @@ fn parse_insert_update_delete_roundtrip() {
     let records = p.parse(&Bytes::from(payload)).unwrap();
     // We expect at least 3 records (insert, update, delete)
     assert!(records.len() >= 3, "records={}", records.len());
+    assert!(matches!(records[0].operation, Operation::Insert));
+    assert!(matches!(records[1].operation, Operation::Update));
+    assert!(matches!(records[2].operation, Operation::Delete));
+    assert_eq!(records[0].table_schema, "public");
+    assert_eq!(records[0].table_name, "t");
+}
+
+#[test]
+fn parse_truncate_roundtrip() {
+    // Build relation message for table "orders" in schema "public"
+    let mut rel = Vec::new();
+    rel.push(b'R');
+    rel.extend_from_slice(&42u32.to_be_bytes()); // relation_id
+    rel.extend_from_slice(b"public\0");
+    rel.extend_from_slice(b"orders\0");
+    rel.push(b'd'); // replica identity
+    rel.extend_from_slice(&1u16.to_be_bytes()); // 1 column
+    rel.push(1u8); // flags
+    rel.extend_from_slice(b"id\0");
+    rel.extend_from_slice(&23u32.to_be_bytes()); // int4 OID
+    rel.extend_from_slice(&(-1i32).to_be_bytes());
+
+    // Build truncate: T + relation_count + flags + relation_ids
+    let mut trunc = Vec::new();
+    trunc.push(b'T');
+    trunc.extend_from_slice(&1u32.to_be_bytes()); // 1 relation
+    trunc.push(0u8); // flags
+    trunc.extend_from_slice(&42u32.to_be_bytes()); // relation_id
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&rel);
+    payload.extend_from_slice(&trunc);
+
+    let p = WalParser::new();
+    let records = p.parse(&Bytes::from(payload)).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected 1 truncate record, got {}",
+        records.len()
+    );
+    assert!(matches!(records[0].operation, Operation::Truncate));
+    assert_eq!(records[0].table_schema, "public");
+    assert_eq!(records[0].table_name, "orders");
+    assert_eq!(records[0].oid, 42);
+    assert!(records[0].new_tuple.is_none());
+    assert!(records[0].old_tuple.is_none());
 }

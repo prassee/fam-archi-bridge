@@ -19,6 +19,15 @@ const (
 	batchSize     = 500
 	numWorkers    = 10
 	targetPerSec  = 10000
+
+	// Table-specific constants
+	usersBatchSize         = 500
+	subscriptionsPerInsert = 4000
+	offersPerInsert        = 100
+
+	// Update intervals
+	updateInterval      = 5 * time.Minute
+	offersInsertInterval = 1 * time.Hour
 )
 
 type Transaction struct {
@@ -71,6 +80,41 @@ type Transaction struct {
 	CreatedAt           time.Time
 }
 
+type User struct {
+	UserID      string
+	SenderName  string
+	ReceiverName string
+	Email       string
+	Phone       string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type UserSubscription struct {
+	SubscriptionID string
+	UserID         string
+	Tier           string
+	BillingCycle   string
+	StartDate      time.Time
+	EndDate        time.Time
+	Status         string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type Offer struct {
+	OfferID     string
+	Name        string
+	Description string
+	DiscountPct float64
+	MinAmount   float64
+	ValidFrom   time.Time
+	ValidTo     time.Time
+	IsActive    bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 func createTable(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS upi_transactions (
@@ -120,6 +164,56 @@ func createTable(ctx context.Context, pool *pgxpool.Pool) error {
 			refund_amount DECIMAL(15,2),
 			merchant_id VARCHAR(50),
 			terminal_id VARCHAR(50),
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS users (
+			user_id VARCHAR(50) PRIMARY KEY,
+			sender_name VARCHAR(100),
+			receiver_name VARCHAR(100),
+			email VARCHAR(100),
+			phone VARCHAR(20),
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS user_subscription (
+			subscription_id VARCHAR(50) PRIMARY KEY,
+			user_id VARCHAR(50),
+			tier VARCHAR(20),
+			billing_cycle VARCHAR(20),
+			start_date DATE,
+			end_date DATE,
+			status VARCHAR(20),
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS offers (
+			offer_id VARCHAR(50) PRIMARY KEY,
+			name VARCHAR(100),
+			description TEXT,
+			discount_pct DECIMAL(5,2),
+			min_amount DECIMAL(15,2),
+			valid_from DATE,
+			valid_to DATE,
+			is_active BOOLEAN DEFAULT TRUE,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP
 		)
@@ -208,6 +302,59 @@ func generateTransaction() Transaction {
 	}
 }
 
+func generateUser() User {
+	now := time.Now()
+	return User{
+		UserID:      gofakeit.UUID(),
+		SenderName:  gofakeit.FirstName(),
+		ReceiverName: gofakeit.LastName(),
+		Email:       gofakeit.Email(),
+		Phone:       gofakeit.Phone(),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+}
+
+func generateSubscription() UserSubscription {
+	now := time.Now()
+	tier := randomChoice([]string{"MONTHLY", "YEARLY"})
+	billingCycle := tier
+	startDate := now
+	endDate := now.AddDate(0, 0, 30)
+	if tier == "YEARLY" {
+		endDate = now.AddDate(1, 0, 0)
+	}
+	status := randomChoice([]string{"ACTIVE", "EXPIRED", "CANCELLED"})
+
+	return UserSubscription{
+		SubscriptionID: gofakeit.UUID(),
+		UserID:         gofakeit.UUID(),
+		Tier:           tier,
+		BillingCycle:   billingCycle,
+		StartDate:      startDate,
+		EndDate:        endDate,
+		Status:         status,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+}
+
+func generateOffer() Offer {
+	now := time.Now()
+	return Offer{
+		OfferID:     gofakeit.UUID(),
+		Name:        gofakeit.Word(),
+		Description: gofakeit.Sentence(10),
+		DiscountPct: round(rand.Float64()*50, 2),
+		MinAmount:   round(rand.Float64()*1000+100, 2),
+		ValidFrom:   now,
+		ValidTo:     now.AddDate(0, 1, 0),
+		IsActive:    rand.Float64() > 0.2,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+}
+
 func round(val float64, precision int) float64 {
 	pow := 1.0
 	for i := 0; i < precision; i++ {
@@ -275,13 +422,88 @@ func insertBatch(ctx context.Context, pool *pgxpool.Pool, batch []Transaction) i
 	return len(batch)
 }
 
+func insertUsersBatch(ctx context.Context, pool *pgxpool.Pool, batch []User) int {
+	if len(batch) == 0 {
+		return 0
+	}
+
+	_, err := pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"users"},
+		[]string{"user_id", "sender_name", "receiver_name", "email", "phone", "created_at", "updated_at"},
+		pgx.CopyFromSlice(len(batch), func(i int) ([]interface{}, error) {
+			u := batch[i]
+			return []interface{}{u.UserID, u.SenderName, u.ReceiverName, u.Email, u.Phone, u.CreatedAt, u.UpdatedAt}, nil
+		}),
+	)
+
+	if err != nil {
+		fmt.Printf("Users batch insert error: %v\n", err)
+		return 0
+	}
+
+	return len(batch)
+}
+
+func insertSubscriptionsBatch(ctx context.Context, pool *pgxpool.Pool, batch []UserSubscription) int {
+	if len(batch) == 0 {
+		return 0
+	}
+
+	_, err := pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"user_subscription"},
+		[]string{"subscription_id", "user_id", "tier", "billing_cycle", "start_date", "end_date", "status", "created_at", "updated_at"},
+		pgx.CopyFromSlice(len(batch), func(i int) ([]interface{}, error) {
+			s := batch[i]
+			return []interface{}{s.SubscriptionID, s.UserID, s.Tier, s.BillingCycle, s.StartDate, s.EndDate, s.Status, s.CreatedAt, s.UpdatedAt}, nil
+		}),
+	)
+
+	if err != nil {
+		fmt.Printf("Subscriptions batch insert error: %v\n", err)
+		return 0
+	}
+
+	return len(batch)
+}
+
+func insertOffersBatch(ctx context.Context, pool *pgxpool.Pool, batch []Offer) int {
+	if len(batch) == 0 {
+		return 0
+	}
+
+	_, err := pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"offers"},
+		[]string{"offer_id", "name", "description", "discount_pct", "min_amount", "valid_from", "valid_to", "is_active", "created_at", "updated_at"},
+		pgx.CopyFromSlice(len(batch), func(i int) ([]interface{}, error) {
+			o := batch[i]
+			return []interface{}{o.OfferID, o.Name, o.Description, o.DiscountPct, o.MinAmount, o.ValidFrom, o.ValidTo, o.IsActive, o.CreatedAt, o.UpdatedAt}, nil
+		}),
+	)
+
+	if err != nil {
+		fmt.Printf("Offers batch insert error: %v\n", err)
+		return 0
+	}
+
+	return len(batch)
+}
+
 func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	interval := float64(batchSize) / float64(targetPerSec)
 
 	var totalInserted atomic.Int64
 	var totalUpdated atomic.Int64
+	var totalUsersInserted atomic.Int64
+	var totalSubsInserted atomic.Int64
+	var totalOffersInserted atomic.Int64
+	var totalUsersUpdated atomic.Int64
+	var totalSubsUpdated atomic.Int64
 	startTime := time.Now()
 
+	// Channel for UPI transactions
 	workChan := make(chan []Transaction, numWorkers)
 	var wg sync.WaitGroup
 
@@ -296,26 +518,140 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 		}()
 	}
 
-	// Start update goroutine - updates 4000-8000 random records every 1 minute
-	updateTicker := time.NewTicker(1 * time.Minute)
-	defer updateTicker.Stop()
+	// Channel for users (fast moving)
+	usersChan := make(chan []User, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range usersChan {
+				inserted := insertUsersBatch(ctx, pool, batch)
+				totalUsersInserted.Add(int64(inserted))
+			}
+		}()
+	}
+
+	// Channel for subscriptions (medium moving)
+	subsChan := make(chan []UserSubscription, 5)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range subsChan {
+				inserted := insertSubscriptionsBatch(ctx, pool, batch)
+				totalSubsInserted.Add(int64(inserted))
+			}
+		}()
+	}
+
+	// Channel for offers (slow moving)
+	offersChan := make(chan []Offer, 5)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range offersChan {
+				inserted := insertOffersBatch(ctx, pool, batch)
+				totalOffersInserted.Add(int64(inserted))
+			}
+		}()
+	}
+
+	// Update goroutines - users: 20-50% of records every 5 minutes
+	userUpdateTicker := time.NewTicker(updateInterval)
+	defer userUpdateTicker.Stop()
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-updateTicker.C:
-				numUpdates := rand.Intn(4001) + 4000 // 4000 to 8000
-				updated := updateRandomRecords(ctx, pool, numUpdates)
-				totalUpdated.Add(int64(updated))
-				fmt.Printf("Updated %d random records (total updates: %d)\n", updated, totalUpdated.Load())
+			case <-userUpdateTicker.C:
+				// Get total count and update 20-50%
+				var count int
+				pool.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&count)
+				if count > 0 {
+					updatePct := 0.2 + rand.Float64()*0.3 // 20-50%
+					numUpdates := int(float64(count) * updatePct)
+					if numUpdates < 100 {
+						numUpdates = 100
+					}
+					updated := updateRandomUsers(ctx, pool, numUpdates)
+					totalUsersUpdated.Add(int64(updated))
+					fmt.Printf("Updated %d user records (total user updates: %d)\n", updated, totalUsersUpdated.Load())
+				}
 			}
 		}
 	}()
 
-	fmt.Printf("Table created. Generating %d txns/sec continuously...\n", targetPerSec)
-	fmt.Println("Random updates of 4000-8000 records will run every 1 minute")
+	// Update goroutines - subscriptions: 20-50% of records every 5 minutes
+	subUpdateTicker := time.NewTicker(updateInterval)
+	defer subUpdateTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-subUpdateTicker.C:
+				var count int
+				pool.QueryRow(ctx, "SELECT COUNT(*) FROM user_subscription").Scan(&count)
+				if count > 0 {
+					updatePct := 0.2 + rand.Float64()*0.3
+					numUpdates := int(float64(count) * updatePct)
+					if numUpdates < 100 {
+						numUpdates = 100
+					}
+					updated := updateRandomSubscriptions(ctx, pool, numUpdates)
+					totalSubsUpdated.Add(int64(updated))
+					fmt.Printf("Updated %d subscription records (total sub updates: %d)\n", updated, totalSubsUpdated.Load())
+				}
+			}
+		}
+	}()
 
+	// Subscription insert ticker - 4000 every 5 minutes
+	subInsertTicker := time.NewTicker(updateInterval)
+	defer subInsertTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-subInsertTicker.C:
+				batch := make([]UserSubscription, subscriptionsPerInsert)
+				for i := 0; i < subscriptionsPerInsert; i++ {
+					batch[i] = generateSubscription()
+				}
+				subsChan <- batch
+			}
+		}
+	}()
+
+	// Offers insert ticker - 100 every 1 hour
+	offersTicker := time.NewTicker(offersInsertInterval)
+	defer offersTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-offersTicker.C:
+				batch := make([]Offer, offersPerInsert)
+				for i := 0; i < offersPerInsert; i++ {
+					batch[i] = generateOffer()
+				}
+				offersChan <- batch
+			}
+		}
+	}()
+
+	fmt.Printf("Tables created. Generating load:\n")
+	fmt.Printf("  - UPI transactions: %d txns/sec\n", targetPerSec)
+	fmt.Printf("  - Users: %d txns/sec (same as UPI)\n", targetPerSec)
+	fmt.Printf("  - Subscriptions: %d every 5 minutes\n", subscriptionsPerInsert)
+	fmt.Printf("  - Offers: %d every 1 hour\n", offersPerInsert)
+	fmt.Println("Updates: 20-50% of users and subscriptions every 5 minutes")
+
+	// Main insert loop for UPI transactions and users (fast moving)
 	ticker := time.NewTicker(time.Duration(interval*1000) * time.Millisecond)
 	defer ticker.Stop()
 
@@ -323,18 +659,34 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 		select {
 		case <-ctx.Done():
 			close(workChan)
+			close(usersChan)
+			close(subsChan)
+			close(offersChan)
 			wg.Wait()
 			elapsed := time.Since(startTime).Seconds()
-			fmt.Printf("\nInserted %d transactions in %.2fs (%.0f txns/sec)\n",
+			fmt.Printf("\n=== Summary ===\n")
+			fmt.Printf("UPI transactions inserted: %d in %.2fs (%.0f txns/sec)\n",
 				totalInserted.Load(), elapsed, float64(totalInserted.Load())/elapsed)
-			fmt.Printf("Total records updated: %d\n", totalUpdated.Load())
+			fmt.Printf("Users inserted: %d\n", totalUsersInserted.Load())
+			fmt.Printf("Subscriptions inserted: %d\n", totalSubsInserted.Load())
+			fmt.Printf("Offers inserted: %d\n", totalOffersInserted.Load())
+			fmt.Printf("Total records updated: %d (UPI), %d (users), %d (subs)\n",
+				totalUpdated.Load(), totalUsersUpdated.Load(), totalSubsUpdated.Load())
 			return
 		case <-ticker.C:
+			// UPI transactions batch
 			batch := make([]Transaction, batchSize)
 			for i := 0; i < batchSize; i++ {
 				batch[i] = generateTransaction()
 			}
 			workChan <- batch
+
+			// Users batch (same rate as UPI transactions)
+			userBatch := make([]User, usersBatchSize)
+			for i := 0; i < usersBatchSize; i++ {
+				userBatch[i] = generateUser()
+			}
+			usersChan <- userBatch
 		}
 	}
 }
@@ -391,6 +743,103 @@ func updateRandomRecords(ctx context.Context, pool *pgxpool.Pool, count int) int
 
 		if err != nil {
 			fmt.Printf("Failed to update transaction %s: %v\n", id, err)
+			continue
+		}
+		updated++
+	}
+
+	return updated
+}
+
+func updateRandomUsers(ctx context.Context, pool *pgxpool.Pool, count int) int {
+	rows, err := pool.Query(ctx, `
+		SELECT user_id FROM users
+		ORDER BY random()
+		LIMIT $1
+	`, count)
+	if err != nil {
+		fmt.Printf("Failed to get random user IDs: %v\n", err)
+		return 0
+	}
+	defer rows.Close()
+
+	var userIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		userIDs = append(userIDs, id)
+	}
+
+	if len(userIDs) == 0 {
+		return 0
+	}
+
+	now := time.Now()
+	updated := 0
+
+	for _, id := range userIDs {
+		_, err := pool.Exec(ctx, `
+			UPDATE users
+			SET sender_name = $1,
+				receiver_name = $2,
+				email = $3,
+				phone = $4,
+				updated_at = $5
+			WHERE user_id = $6
+		`, gofakeit.FirstName(), gofakeit.LastName(), gofakeit.Email(), gofakeit.Phone(), now, id)
+
+		if err != nil {
+			continue
+		}
+		updated++
+	}
+
+	return updated
+}
+
+func updateRandomSubscriptions(ctx context.Context, pool *pgxpool.Pool, count int) int {
+	rows, err := pool.Query(ctx, `
+		SELECT subscription_id FROM user_subscription
+		ORDER BY random()
+		LIMIT $1
+	`, count)
+	if err != nil {
+		fmt.Printf("Failed to get random subscription IDs: %v\n", err)
+		return 0
+	}
+	defer rows.Close()
+
+	var subIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		subIDs = append(subIDs, id)
+	}
+
+	if len(subIDs) == 0 {
+		return 0
+	}
+
+	now := time.Now()
+	updated := 0
+
+	for _, id := range subIDs {
+		status := randomChoice([]string{"ACTIVE", "EXPIRED", "CANCELLED"})
+		_, err := pool.Exec(ctx, `
+			UPDATE user_subscription
+			SET status = $1,
+				tier = $2,
+				end_date = $3,
+				updated_at = $4
+			WHERE subscription_id = $5
+		`, status, randomChoice([]string{"MONTHLY", "YEARLY"}),
+			now.AddDate(0, rand.Intn(12)+1, 0), now, id)
+
+		if err != nil {
 			continue
 		}
 		updated++

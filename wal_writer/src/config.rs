@@ -14,7 +14,7 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn from_env() -> Result<Self, env::VarError> {
         let state_dir = env::var("WAL_WRITER_STATE_DIR").ok().map(PathBuf::from);
-        
+
         Ok(Self {
             pg: PostgresConfig {
                 host: env::var("WAL_WRITER_PG_HOST").unwrap_or_else(|_| "localhost".to_string()),
@@ -24,18 +24,31 @@ impl AppConfig {
                     .unwrap_or(5432),
                 user: env::var("WAL_WRITER_PG_USER").unwrap_or_else(|_| "postgres".to_string()),
                 password: env::var("WAL_WRITER_PG_PASSWORD").unwrap_or_else(|_| "".to_string()),
-                database: env::var("WAL_WRITER_PG_DATABASE").unwrap_or_else(|_| "postgres".to_string()),
+                database: env::var("WAL_WRITER_PG_DATABASE")
+                    .unwrap_or_else(|_| "postgres".to_string()),
                 slot_name: env::var("WAL_WRITER_PG_SLOT_NAME").ok(),
             },
             kafka: KafkaConfig {
-                brokers: env::var("WAL_WRITER_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string()),
-                topic_prefix: env::var("WAL_WRITER_KAFKA_TOPIC_PREFIX").unwrap_or_else(|_| "cdc".to_string()),
+                brokers: env::var("WAL_WRITER_KAFKA_BROKERS")
+                    .unwrap_or_else(|_| "localhost:9092".to_string()),
+                topic_prefix: env::var("WAL_WRITER_KAFKA_TOPIC_PREFIX")
+                    .unwrap_or_else(|_| "cdc".to_string()),
                 acks: env::var("WAL_WRITER_KAFKA_ACKS").unwrap_or_else(|_| "all".to_string()),
-                linger_ms: env::var("WAL_WRITER_KAFKA_LINGER_MS").unwrap_or_else(|_| "5".to_string()).parse().unwrap_or(5),
-                batch_size: env::var("WAL_WRITER_KAFKA_BATCH_SIZE").unwrap_or_else(|_| "16384".to_string()).parse().unwrap_or(16384),
+                linger_ms: env::var("WAL_WRITER_KAFKA_LINGER_MS")
+                    .unwrap_or_else(|_| "5".to_string())
+                    .parse()
+                    .unwrap_or(5),
+                batch_size: env::var("WAL_WRITER_KAFKA_BATCH_SIZE")
+                    .unwrap_or_else(|_| "16384".to_string())
+                    .parse()
+                    .unwrap_or(16384),
                 compression: env::var("WAL_WRITER_KAFKA_COMPRESSION").ok(),
             },
-            replication: ReplicationConfig::default(),
+            replication: ReplicationConfig {
+                publication: env::var("WAL_WRITER_PUBLICATION")
+                    .unwrap_or_else(|_| "wal_writer_publication".to_string()),
+                ..Default::default()
+            },
             logging: LoggingConfig::default(),
             state: StateConfig {
                 directory: state_dir,
@@ -89,6 +102,7 @@ impl KafkaConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReplicationConfig {
+    pub publication: String,
     pub wal_position: Option<String>,
     pub batch_size: u32,
     pub poll_interval_ms: u32,
@@ -97,6 +111,7 @@ pub struct ReplicationConfig {
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
+            publication: String::from("wal_writer_publication"),
             wal_position: None,
             batch_size: 100,
             poll_interval_ms: 10,
