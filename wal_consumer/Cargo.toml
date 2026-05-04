@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
+futures = "0.3"
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+tokio = { version = "1.47", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wal-common = { path = "../wal_common" }

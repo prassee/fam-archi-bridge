@@ -6,8 +6,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::Producer;
 use tracing::info;
-
-use crate::config::AppConfig;
+use wal_common::AppConfig;
 
 pub struct KafkaProducer {
     producer: rdkafka::producer::ThreadedProducer<rdkafka::producer::DefaultProducerContext>,
@@ -50,17 +49,10 @@ impl KafkaProducer {
         &self.topic_prefix
     }
 
-    pub fn send(
-        &self,
-        topic: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), KafkaError> {
+    pub fn send(&self, topic: &str, key: &str, value: &str) -> Result<(), KafkaError> {
         use rdkafka::producer::BaseRecord;
-        
-        let record = BaseRecord::to(topic)
-            .key(key)
-            .payload(value);
+
+        let record = BaseRecord::to(topic).key(key).payload(value);
         self.producer.send(record).map_err(|(e, _)| e)
     }
 

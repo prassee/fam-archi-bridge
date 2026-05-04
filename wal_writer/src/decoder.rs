@@ -52,13 +52,41 @@ impl WalDecoder {
                 let key = record.tx_xid.to_string();
                 let value = serde_json::to_string(&record)?;
 
-                if let Err(e) = self.kafka.send(&topic, &key, &value) {
-                    error!("Kafka send failed topic='{}' xid={}: {}", topic, key, e);
-                    self.metrics.kafka_send_errors_inc();
-                    failed += 1;
-                } else {
-                    self.metrics.kafka_messages_sent_inc();
-                    sent += 1;
+                // Retry with exponential backoff on QueueFull
+                let mut retry_count = 0;
+                let max_retries = 5;
+                let mut backoff_ms = 10u64;
+
+                loop {
+                    match self.kafka.send(&topic, &key, &value) {
+                        Ok(()) => {
+                            self.metrics.kafka_messages_sent_inc();
+                            sent += 1;
+                            break;
+                        }
+                        Err(e) => {
+                            if retry_count < max_retries && e.to_string().contains("QueueFull") {
+                                warn!(
+                                    "Kafka queue full for topic='{}', retrying in {}ms (attempt {}/{})",
+                                    topic,
+                                    backoff_ms,
+                                    retry_count + 1,
+                                    max_retries
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                                backoff_ms = (backoff_ms * 2).min(500); // Cap backoff at 500ms
+                                retry_count += 1;
+                            } else {
+                                error!(
+                                    "Kafka send failed topic='{}' xid={} (retries={}): {}",
+                                    topic, key, retry_count, e
+                                );
+                                self.metrics.kafka_send_errors_inc();
+                                failed += 1;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 

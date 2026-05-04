@@ -20,22 +20,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy dependency files first for better layer caching
-COPY Cargo.toml Cargo.lock ./
+COPY wal_common/Cargo.toml wal_common/Cargo.toml
+COPY wal_common/src wal_common/src
+COPY wal_writer/Cargo.toml wal_writer/Cargo.toml
+COPY wal_writer/Cargo.lock wal_writer/Cargo.lock
 
 # Create a dummy src/main.rs to fetch dependencies
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "" > src/lib.rs
+RUN mkdir -p wal_writer/src && \
+    echo "fn main() {}" > wal_writer/src/main.rs && \
+    echo "" > wal_writer/src/lib.rs
 
 # Fetch dependencies
-RUN cargo fetch
+RUN cargo fetch --manifest-path wal_writer/Cargo.toml
 
 # Copy source code
-COPY src ./src
+COPY wal_writer/src wal_writer/src
 
 # Build release binary
-RUN cargo build --release && \
-    strip /app/target/release/rust-wal-cake-writer
+RUN cargo build --release --manifest-path wal_writer/Cargo.toml && \
+    strip /app/wal_writer/target/release/rust-wal-cake-writer
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -50,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/rust-wal-cake-writer /app/rust-wal-cake-writer
+COPY --from=builder /app/wal_writer/target/release/rust-wal-cake-writer /app/rust-wal-cake-writer
 
 # Create log directory
 RUN mkdir -p /var/log/wal-writer

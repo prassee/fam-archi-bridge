@@ -210,8 +210,8 @@ services:
     container_name: wal-writer
     hostname: wal-writer
     build:
-      context: ./wal_writer
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: wal_writer/Dockerfile
     ports:
       - "9090:9090"
     environment:
@@ -263,6 +263,25 @@ services:
     # Resource hints (K8s requests: 500m CPU, 512Mi memory; limits: 2000m CPU, 2Gi memory)
     # Note: K8s deployment has 2 replicas with pod anti-affinity
     # For local testing, use 1 replica; scale with: docker-compose up --scale wal-writer=2
+
+    # WAL Consumer service
+    # Consumes CDC messages from Kafka and prints them to stdout
+  wal-consumer:
+    image: wal-consumer:latest
+    container_name: wal-consumer
+    hostname: wal-consumer
+    build:
+      context: .
+      dockerfile: wal_consumer/Dockerfile
+    environment:
+      WAL_WRITER_KAFKA_BROKERS: kafka:9092
+      WAL_WRITER_KAFKA_TOPIC_PREFIX: cdc
+      WAL_CONSUMER_GROUP_ID: wal-consumer-console
+      RUST_LOG: info
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres-data:

@@ -5,8 +5,8 @@ use tokio::signal;
 use tracing::{error, info};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use wal_common::AppConfig;
 
-mod config;
 mod decoder;
 mod kafka;
 mod metrics;
@@ -14,7 +14,6 @@ mod pg_replication;
 mod state;
 mod wal_parser;
 
-pub use config::AppConfig;
 pub use metrics::Metrics;
 pub use state::LsnTracker;
 
