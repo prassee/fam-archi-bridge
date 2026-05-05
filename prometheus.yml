@@ -17,3 +17,9 @@ scrape_configs:
     static_configs:
       - targets: ['kafka-exporter:9308']
     scrape_interval: 5s
+
+  - job_name: 'wal-writer-go'
+    static_configs:
+      - targets: ['wal-writer:9090']
+    metrics_path: /metrics
+    scrape_interval: 5s

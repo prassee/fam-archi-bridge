@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Docker Compose manifest derived from Kubernetes manifests in k8s/ folder
 # Includes all services, configurations, volumes, and environment variables
 
@@ -118,11 +116,12 @@ services:
         done
         echo "PostgreSQL is ready. Creating replication slot and publication if not exists..."
         psql -h postgres -p 5432 -U postgres -d postgres <<-EOSQL
-          SELECT pg_create_logical_replication_slot('wal_writer_slot', 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot');
-          SELECT slot_name, plugin, slot_type, active FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot';
-          CREATE PUBLICATION IF NOT EXISTS wal_writer_publication FOR ALL TABLES;
+          SELECT pg_create_logical_replication_slot('wal_writer_slot_v2', 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot_v2');
+          SELECT slot_name, plugin, slot_type, active FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot_v2';
           SELECT pubname, puballtables FROM pg_publication WHERE pubname = 'wal_writer_publication';
         EOSQL
+        psql -h postgres -p 5432 -U postgres -d postgres -c "CREATE PUBLICATION wal_writer_publication FOR ALL TABLES" 2>/dev/null || echo "Publication already exists"
+        psql -h postgres -p 5432 -U postgres -d postgres -c "SELECT pubname, puballtables FROM pg_publication WHERE pubname = 'wal_writer_publication';"
         echo "Replication slot and publication check/creation completed."
     depends_on:
       postgres:
@@ -138,6 +137,7 @@ services:
       - "9308:9308"
     command:
       - "--kafka.server=kafka:9092"
+      - "--offset.show-all"
     depends_on:
       kafka:
         condition: service_healthy
@@ -203,7 +203,7 @@ services:
       - prometheus
     restart: unless-stopped
 
-  # WAL Writer service
+  # WAL Writer service (Go implementation)
   # Derived from k8s/deployment.yaml and k8s/configmap.yaml
   wal-writer:
     image: wal-writer:latest
@@ -211,7 +211,7 @@ services:
     hostname: wal-writer
     build:
       context: .
-      dockerfile: wal_writer/Dockerfile
+      dockerfile: wal_writer_go/Dockerfile
     ports:
       - "9090:9090"
     environment:
@@ -224,7 +224,7 @@ services:
       WAL_WRITER_PG_USER: postgres
       WAL_WRITER_PG_PASSWORD: postgres
       WAL_WRITER_PG_DATABASE: postgres
-      WAL_WRITER_PG_SLOT_NAME: wal_writer_slot
+      WAL_WRITER_PG_SLOT_NAME: wal_writer_slot_v2
       # Kafka config (from k8s/kustomization.yaml and k8s/configmap.yaml)
       WAL_WRITER_KAFKA_BROKERS: kafka:9092
       WAL_WRITER_KAFKA_TOPIC_PREFIX: cdc
@@ -241,9 +241,6 @@ services:
       # Note: K8s uses ConfigMap and Secret for these values
       # ConfigMap: wal-writer-config (k8s/configmap.yaml + k8s/kustomization.yaml)
       # Secret: wal-writer-secret (k8s/configmap.yaml)
-    command:
-      - "--pod-name=$(POD_NAME)"
-      - "--pod-ip=$(POD_IP)"
     volumes:
       - logs-data:/var/log/wal-writer
     depends_on:
@@ -263,6 +260,53 @@ services:
     # Resource hints (K8s requests: 500m CPU, 512Mi memory; limits: 2000m CPU, 2Gi memory)
     # Note: K8s deployment has 2 replicas with pod anti-affinity
     # For local testing, use 1 replica; scale with: docker-compose up --scale wal-writer=2
+
+    # Deprecated legacy Rust WAL Writer (opt-in only)
+  wal-writer-rust:
+    image: wal-writer-rust:latest
+    container_name: wal-writer-rust
+    hostname: wal-writer-rust
+    profiles: [ "deprecated-rust" ]
+    build:
+      context: .
+      dockerfile: wal_writer/Dockerfile
+    ports:
+      - "9095:9090"
+    environment:
+      WAL_WRITER_PG_HOST: postgres
+      WAL_WRITER_PG_PORT: 5432
+      WAL_WRITER_PG_USER: postgres
+      WAL_WRITER_PG_PASSWORD: postgres
+      WAL_WRITER_PG_DATABASE: postgres
+      WAL_WRITER_PG_SLOT_NAME: wal_writer_slot_v2
+      WAL_WRITER_KAFKA_BROKERS: kafka:9092
+      WAL_WRITER_KAFKA_TOPIC_PREFIX: cdc
+      WAL_WRITER_KAFKA_ACKS: all
+      WAL_WRITER_KAFKA_LINGER_MS: 5
+      WAL_WRITER_KAFKA_BATCH_SIZE: 16384
+      WAL_WRITER_PUBLICATION: wal_writer_publication
+      WAL_WRITER_REPLICATION_BATCH_SIZE: 100
+      WAL_WRITER_REPLICATION_POLL_INTERVAL_MS: 10
+      WAL_WRITER_LOGGING_LEVEL: info
+      WAL_WRITER_LOGGING_DIRECTORY: /var/log/wal-writer
+    volumes:
+      - logs-data:/var/log/wal-writer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9090/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: "no"
+    # Start manually only for rollback tests:
+    # docker compose --profile deprecated-rust up -d wal-writer-rust
 
     # WAL Consumer service
     # Consumes CDC messages from Kafka and prints them to stdout

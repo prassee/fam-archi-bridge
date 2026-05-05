@@ -1,5 +1,6 @@
-# Multi-stage Dockerfile for WAL Writer (Rust)
-# Derived from K8s deployment requirements
+# DEPRECATED: Legacy Rust WAL Writer image
+# The default WAL Writer runtime is now Go. This Dockerfile is kept only
+# for backward compatibility and can be enabled via a deprecated profile.
 
 # Stage 1: Build
 FROM rust:1.88 AS builder

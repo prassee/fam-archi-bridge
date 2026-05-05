@@ -39,9 +39,9 @@ Go Data Pump ──(insert & update)──► PgSQL
 ```
 
 ### Phase 2 — CDC Capture & Streaming ✅ Complete
-The **WAL Cake Agent** (this Rust project) connects to PostgreSQL via logical replication, consumes the Write-Ahead Log, decodes change events (Insert/Update/Delete/Truncate), and pushes them as structured CDC messages to **Kafka Topics**. Metrics are exported to **Grafana** for observability.
+The **WAL Cake Agent** (Go implementation) connects to PostgreSQL via logical replication, consumes the Write-Ahead Log, decodes change events (Insert/Update/Delete/Truncate), and pushes them as structured CDC messages to **Kafka Topics**. Metrics are exported to **Grafana** for observability.
 
-Deployed services: `wal-writer` (Rust CDC agent, metrics on `:9090`), `kafka` (Confluent CP-Kafka 7.5, auto topic creation enabled on port `9092`).
+Deployed services: `wal-writer` (Go CDC agent, metrics on `:9090`), `kafka` (Confluent CP-Kafka 7.5, auto topic creation enabled on port `9092`).
 
 Verified: the replication loop now parses pgoutput messages end-to-end, acknowledges consumed LSNs back to PostgreSQL, persists commit progress, and publishes CDC events to Kafka topics. Observability is in place through Prometheus, PostgreSQL Exporter, Kafka Exporter, and Grafana dashboards.
 
@@ -86,29 +86,33 @@ rust-wal-cake-writer/
 │   ├── go.sum
 │   ├── Dockerfile
 │   └── README.md
-└── wal_writer/               # Main Rust project
-    ├── Cargo.toml
-    ├── Cargo.lock
-    ├── Dockerfile
-    ├── src/
-    │   ├── main.rs           # Entry point
-    │   ├── lib.rs            # Library root
-    │   ├── config.rs         # Configuration from env vars
-    │   ├── decoder.rs        # Kafka message encoding
-    │   ├── kafka.rs          # Kafka producer
-    │   ├── metrics.rs        # Prometheus metrics
-    │   ├── pg_replication.rs # PostgreSQL replication
-    │   ├── state.rs          # State persistence
-    │   └── wal_parser.rs     # WAL message parser
-    └── tests/
-        ├── wal_parser_tests.rs
-        └── wal_parser_fixtures.rs
+├── wal_writer_go/            # Main Go WAL writer project
+│   ├── Dockerfile
+│   ├── go.mod
+│   └── main.go
+└── wal_writer/               # Deprecated Rust WAL writer (legacy fallback)
+   ├── Cargo.toml
+   ├── Cargo.lock
+   ├── Dockerfile            # Deprecated image, retained for rollback only
+   ├── src/
+   │   ├── main.rs
+   │   ├── lib.rs
+   │   ├── config.rs
+   │   ├── decoder.rs
+   │   ├── kafka.rs
+   │   ├── metrics.rs
+   │   ├── pg_replication.rs
+   │   ├── state.rs
+   │   └── wal_parser.rs
+   └── tests/
+      ├── wal_parser_tests.rs
+      └── wal_parser_fixtures.rs
 ```
 
 ## Build
 
 ```bash
-cargo build --release
+docker compose build wal-writer
 ```
 
 ## Environment Variables
@@ -148,7 +152,7 @@ Each table maps to `{topic_prefix}.{schema}.{table}` (e.g., `cdc.public.users`).
 ## Run
 
 ```bash
-./target/release/rust-wal-cake-writer
+docker compose up -d wal-writer
 ```
 
 ## Kubernetes
@@ -196,7 +200,8 @@ All Phase 1 and Phase 2 services plus the full monitoring stack are available vi
 | `kafka` | confluentinc/cp-kafka:7.5.0 | 9092 | CDC event broker |
 | `data-pump-go` | data-pump-go:latest | — | UPI transaction load generator |
 | `db-init` | postgres:16-alpine | — | One-shot: creates replication slot + publication |
-| `wal-writer` | wal-writer:latest | 9090 | CDC agent (metrics on `/health`, `/ready`) |
+| `wal-writer` | wal-writer:latest | 9090 | Go CDC agent (metrics on `/health`, `/ready`) |
+| `wal-writer-rust` | wal-writer-rust:latest | 9095 | Deprecated Rust fallback (disabled by default) |
 | `postgres-exporter` | prometheuscommunity/postgres-exporter | 9187 | PostgreSQL metrics exporter |
 | `kafka-exporter` | danielqsj/kafka-exporter:latest | 9308 | Kafka broker and topic metrics exporter |
 | `prometheus` | prom/prometheus | 9091 | Metrics collection |
@@ -248,14 +253,11 @@ wal-writer (:9090/metrics) ───────────┘
 
 ## Notes
 
-- Uses PostgreSQL logical replication via `tokio-postgres::copy_out()`
-- Custom WAL parser for decoding replication messages
-- Kafka producer with configurable batch settings
-- Sub-second latency via 10ms poll interval
-- Uses PostgreSQL logical replication via `pgwire-replication` (streaming) and `pg_walstream` for pgoutput parsing
-- WAL parser implemented with pg_walstream: decodes Relation/Begin/Commit/Insert/Update/Delete/Truncate messages, caches relation metadata, maps tuple columns to named columns and attaches transaction metadata when available
-- Unit test added: tests/wal_parser_tests.rs (basic empty payload test). More fixtures can be added using pg_walstream helpers
-- Note: building pg_walstream requires libpq headers on some systems. On macOS install libpq via Homebrew: `brew install libpq && brew link --force libpq`
+- WAL Writer default runtime is now Go (`wal_writer_go/`)
+- Rust WAL Writer (`wal_writer/`) is deprecated and kept only for rollback safety
+- Kafka topic naming remains `{topic_prefix}.{schema}.{table}`
+- Metrics endpoint remains on `:9090` with `/health` and `/ready`
+- Use Docker Compose profile `deprecated-rust` only when validating legacy fallback
 
 ## Next Steps
 
@@ -281,3 +283,5 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Added PostgreSQL and Kafka Grafana dashboard support, including datasource fixes and stable template queries for Kafka exporter metrics.
 - Updated the PostgreSQL dashboard to show WAL size, database size, and slot lag in GB.
 - Capped PostgreSQL WAL retention to 5GB in Docker Compose using `max_wal_size` and `max_slot_wal_keep_size`.
+- Converted WAL Writer runtime container from Rust to Go for active development.
+- Deprecated Rust WAL Writer component and moved it behind an opt-in Docker Compose profile.

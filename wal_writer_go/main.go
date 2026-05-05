@@ -1,0 +1,871 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/segmentio/kafka-go"
+)
+
+type appConfig struct {
+	pgHost      string
+	pgPort      string
+	pgUser      string
+	pgPassword  string
+	pgDatabase  string
+	pgSlotName  string
+	publication string
+	kafkaBroker string
+	topicPrefix string
+	acks        string
+	lingerMs    int
+	pollMs      int
+}
+
+type relationColumn struct {
+	Name    string
+	TypeOID uint32
+}
+
+type relationMeta struct {
+	ID      uint32
+	Schema  string
+	Table   string
+	Columns []relationColumn
+}
+
+type txnState struct {
+	XID        uint32
+	CommitTime int64
+	LSN        uint64
+}
+
+type column struct {
+	Name   string `json:"name"`
+	TypeID uint32 `json:"type_oid"`
+	Value  any    `json:"value"`
+	IsNull bool   `json:"is_null"`
+}
+
+type rowData struct {
+	Columns []column `json:"columns"`
+}
+
+type walRecord struct {
+	LSN          uint64   `json:"lsn"`
+	TableSchema  string   `json:"table_schema"`
+	TableName    string   `json:"table_name"`
+	Operation    string   `json:"operation"`
+	OID          uint32   `json:"oid"`
+	NewTuple     *rowData `json:"new_tuple"`
+	OldTuple     *rowData `json:"old_tuple"`
+	TxCommitTime int64    `json:"tx_commit_time"`
+	TxXID        uint32   `json:"tx_xid"`
+}
+
+type cdcState struct {
+	relations map[uint32]relationMeta
+	txn       txnState
+}
+
+type runtime struct {
+	logger *log.Logger
+	cfg    appConfig
+	ready  atomic.Bool
+	writer *kafka.Writer
+	state  cdcState
+	stats  writerStats
+	m      *walMetrics
+}
+
+type writerStats struct {
+	published atomic.Uint64
+	failed    atomic.Uint64
+}
+
+type walMetrics struct {
+	ready                  prometheus.Gauge
+	replicationConnected   prometheus.Gauge
+	lastReceiveLSN         prometheus.Gauge
+	lastProcessLSN         prometheus.Gauge
+	walMessages            *prometheus.CounterVec
+	publishedRecords       *prometheus.CounterVec
+	publishFailures        *prometheus.CounterVec
+	publishDurationSeconds prometheus.Histogram
+	replicationLoopExits   prometheus.Counter
+	processWALErrors       prometheus.Counter
+	slotResets             prometheus.Counter
+}
+
+func newWalMetrics() *walMetrics {
+	m := &walMetrics{
+		ready: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wal_writer_ready",
+			Help: "Readiness state of wal-writer-go (1=ready, 0=not ready)",
+		}),
+		replicationConnected: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wal_writer_replication_connected",
+			Help: "Replication connection state (1=connected, 0=disconnected)",
+		}),
+		lastReceiveLSN: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wal_writer_last_receive_lsn",
+			Help: "Last WAL LSN received from PostgreSQL",
+		}),
+		lastProcessLSN: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wal_writer_last_process_lsn",
+			Help: "Last WAL LSN processed by wal-writer-go",
+		}),
+		walMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wal_writer_wal_messages_total",
+			Help: "Number of parsed WAL protocol messages by type",
+		}, []string{"type"}),
+		publishedRecords: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wal_writer_published_records_total",
+			Help: "Number of CDC records published to Kafka",
+		}, []string{"operation", "topic"}),
+		publishFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wal_writer_publish_failures_total",
+			Help: "Number of CDC publish failures",
+		}, []string{"operation", "topic"}),
+		publishDurationSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "wal_writer_publish_duration_seconds",
+			Help:    "End-to-end latency of Kafka publish attempts",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+		}),
+		replicationLoopExits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wal_writer_replication_loop_exits_total",
+			Help: "Count of replication loop exits",
+		}),
+		processWALErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wal_writer_process_wal_errors_total",
+			Help: "Count of WAL processing errors",
+		}),
+		slotResets: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wal_writer_slot_resets_total",
+			Help: "Count of replication slot reset operations after slot-loss errors",
+		}),
+	}
+
+	prometheus.MustRegister(
+		m.ready,
+		m.replicationConnected,
+		m.lastReceiveLSN,
+		m.lastProcessLSN,
+		m.walMessages,
+		m.publishedRecords,
+		m.publishFailures,
+		m.publishDurationSeconds,
+		m.replicationLoopExits,
+		m.processWALErrors,
+		m.slotResets,
+	)
+
+	return m
+}
+
+func readEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func readEnvInt(key string, fallback int) int {
+	val := strings.TrimSpace(readEnv(key, ""))
+	if val == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func loadConfig() appConfig {
+	return appConfig{
+		pgHost:      readEnv("WAL_WRITER_PG_HOST", "localhost"),
+		pgPort:      readEnv("WAL_WRITER_PG_PORT", "5432"),
+		pgUser:      readEnv("WAL_WRITER_PG_USER", "postgres"),
+		pgPassword:  readEnv("WAL_WRITER_PG_PASSWORD", ""),
+		pgDatabase:  readEnv("WAL_WRITER_PG_DATABASE", "postgres"),
+		pgSlotName:  readEnv("WAL_WRITER_PG_SLOT_NAME", "wal_writer_slot"),
+		publication: readEnv("WAL_WRITER_PUBLICATION", "wal_writer_publication"),
+		kafkaBroker: readEnv("WAL_WRITER_KAFKA_BROKERS", "localhost:9092"),
+		topicPrefix: readEnv("WAL_WRITER_KAFKA_TOPIC_PREFIX", "cdc"),
+		acks:        readEnv("WAL_WRITER_KAFKA_ACKS", "all"),
+		lingerMs:    readEnvInt("WAL_WRITER_KAFKA_LINGER_MS", 5),
+		pollMs:      readEnvInt("WAL_WRITER_REPLICATION_POLL_INTERVAL_MS", 100),
+	}
+}
+
+func healthMux(ready *atomic.Bool) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not-ready"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
+}
+
+func newRuntime(cfg appConfig, logger *log.Logger) *runtime {
+	writer := &kafka.Writer{
+		Addr:                   kafka.TCP(strings.Split(cfg.kafkaBroker, ",")...),
+		Balancer:               &kafka.Hash{},
+		RequiredAcks:           kafka.RequireAll,
+		BatchTimeout:           time.Duration(cfg.lingerMs) * time.Millisecond,
+		AllowAutoTopicCreation: true,
+	}
+	if strings.EqualFold(cfg.acks, "1") {
+		writer.RequiredAcks = kafka.RequireOne
+	}
+	if strings.EqualFold(cfg.acks, "0") {
+		writer.RequiredAcks = kafka.RequireNone
+	}
+
+	rt := &runtime{
+		logger: logger,
+		cfg:    cfg,
+		writer: writer,
+		m:      newWalMetrics(),
+		state: cdcState{
+			relations: map[uint32]relationMeta{},
+		},
+	}
+	rt.m.ready.Set(0)
+	rt.m.replicationConnected.Set(0)
+	return rt
+}
+
+func main() {
+	cfg := loadConfig()
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+	logger.Printf("starting wal-writer (go): pg=%s:%s db=%s slot=%s kafka=%s publication=%s topic_prefix=%s",
+		cfg.pgHost, cfg.pgPort, cfg.pgDatabase, cfg.pgSlotName, cfg.kafkaBroker, cfg.publication, cfg.topicPrefix)
+
+	rt := newRuntime(cfg, logger)
+
+	server := &http.Server{
+		Addr:              ":9090",
+		Handler:           healthMux(&rt.ready),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatalf("health server failed: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.runReplication(ctx)
+	}()
+
+	go rt.logStats(ctx)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-stop:
+		logger.Printf("received shutdown signal: %s", sig)
+		cancel()
+	case err := <-errCh:
+		if err != nil {
+			logger.Printf("replication loop exited with error: %v", err)
+		}
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	_ = server.Shutdown(shutdownCtx)
+	_ = rt.writer.Close()
+	logger.Println("wal-writer (go) stopped")
+}
+
+func (rt *runtime) runReplication(ctx context.Context) error {
+	defer rt.m.replicationLoopExits.Inc()
+	rt.m.replicationConnected.Set(0)
+	rt.ready.Store(false)
+	rt.m.ready.Set(0)
+
+	connStr := "host=" + rt.cfg.pgHost +
+		" port=" + rt.cfg.pgPort +
+		" user=" + rt.cfg.pgUser +
+		" password=" + rt.cfg.pgPassword +
+		" dbname=" + rt.cfg.pgDatabase +
+		" replication=database"
+
+	conn, err := pgconn.Connect(ctx, connStr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+
+	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
+	if err != nil {
+		return err
+	}
+	rt.m.replicationConnected.Set(1)
+	defer rt.m.replicationConnected.Set(0)
+	rt.logger.Printf("replication connected: systemid=%s timeline=%d xlogpos=%s db=%s", sysident.SystemID, sysident.Timeline, sysident.XLogPos.String(), sysident.DBName)
+
+	pluginArgs := []string{
+		"proto_version '1'",
+		"publication_names '" + rt.cfg.publication + "'",
+	}
+	if err := pglogrepl.StartReplication(ctx, conn, rt.cfg.pgSlotName, pglogrepl.LSN(0), pglogrepl.StartReplicationOptions{PluginArgs: pluginArgs}); err != nil {
+		if slotLostError(err) {
+			rt.logger.Printf("replication slot appears lost, attempting recreation: %v", err)
+			if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
+				return errors.Join(err, resetErr)
+			}
+			if err = pglogrepl.StartReplication(ctx, conn, rt.cfg.pgSlotName, pglogrepl.LSN(0), pglogrepl.StartReplicationOptions{PluginArgs: pluginArgs}); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	rt.ready.Store(true)
+	rt.m.ready.Set(1)
+	rt.logger.Printf("started logical replication slot=%s publication=%s", rt.cfg.pgSlotName, rt.cfg.publication)
+
+	standbyTimeout := 10 * time.Second
+	nextStatus := time.Now().Add(standbyTimeout)
+
+	var lastLSN pglogrepl.LSN
+
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		if time.Now().After(nextStatus) {
+			err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
+				WALWritePosition: lastLSN,
+				WALFlushPosition: lastLSN,
+				WALApplyPosition: lastLSN,
+			})
+			if err != nil {
+				return err
+			}
+			nextStatus = time.Now().Add(standbyTimeout)
+		}
+
+		recvCtx, cancelRecv := context.WithTimeout(ctx, time.Duration(rt.cfg.pollMs)*time.Millisecond)
+		msg, recvErr := conn.ReceiveMessage(recvCtx)
+		cancelRecv()
+
+		if recvErr != nil {
+			if pgconn.Timeout(recvErr) || errors.Is(recvErr, context.DeadlineExceeded) || errors.Is(recvErr, context.Canceled) {
+				continue
+			}
+			if slotLostError(recvErr) {
+				rt.logger.Printf("replication slot lost during receive, resetting slot")
+				if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
+					return errors.Join(recvErr, resetErr)
+				}
+				return rt.runReplication(ctx)
+			}
+			return recvErr
+		}
+
+		copyData, ok := msg.(*pgproto3.CopyData)
+		if !ok || len(copyData.Data) == 0 {
+			continue
+		}
+
+		switch copyData.Data[0] {
+		case pglogrepl.PrimaryKeepaliveMessageByteID:
+			rt.m.walMessages.WithLabelValues("keepalive").Inc()
+			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(copyData.Data[1:])
+			if err != nil {
+				return err
+			}
+			if pkm.ServerWALEnd > lastLSN {
+				lastLSN = pkm.ServerWALEnd
+				rt.m.lastReceiveLSN.Set(float64(lastLSN))
+			}
+			if pkm.ReplyRequested {
+				nextStatus = time.Time{}
+			}
+		case pglogrepl.XLogDataByteID:
+			rt.m.walMessages.WithLabelValues("xlogdata").Inc()
+			xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
+			if err != nil {
+				return err
+			}
+			if xld.WALStart > lastLSN {
+				lastLSN = xld.WALStart
+				rt.m.lastReceiveLSN.Set(float64(lastLSN))
+			}
+			rt.m.lastProcessLSN.Set(float64(xld.WALStart))
+			if err := rt.processWALData(ctx, xld.WALData, uint64(xld.WALStart)); err != nil {
+				rt.m.processWALErrors.Inc()
+				rt.logger.Printf("process WAL data error: %v", err)
+			}
+			// ACK the end of this XLogData block to PostgreSQL so confirmed_flush_lsn
+			// advances and WAL can be recycled after successful Kafka publish.
+			if xld.ServerWALEnd > lastLSN {
+				lastLSN = xld.ServerWALEnd
+				rt.m.lastReceiveLSN.Set(float64(lastLSN))
+				rt.m.lastProcessLSN.Set(float64(lastLSN))
+			}
+			nextStatus = time.Time{} // force immediate StandbyStatusUpdate
+		}
+	}
+}
+
+func (rt *runtime) processWALData(ctx context.Context, wal []byte, lsn uint64) error {
+	buf := wal
+	for len(buf) > 0 {
+		msgType := buf[0]
+		buf = buf[1:]
+		rt.m.walMessages.WithLabelValues(string(msgType)).Inc()
+
+		switch msgType {
+		case 'B':
+			if len(buf) < 20 {
+				return errors.New("short BEGIN message")
+			}
+			rt.state.txn.LSN = binary.BigEndian.Uint64(buf[0:8])
+			rt.state.txn.CommitTime = int64(binary.BigEndian.Uint64(buf[8:16]))
+			rt.state.txn.XID = binary.BigEndian.Uint32(buf[16:20])
+			buf = buf[20:]
+		case 'C':
+			if len(buf) < 25 {
+				return errors.New("short COMMIT message")
+			}
+			rt.state.txn.LSN = binary.BigEndian.Uint64(buf[1:9])
+			rt.state.txn.CommitTime = int64(binary.BigEndian.Uint64(buf[17:25]))
+			buf = buf[25:]
+		case 'R':
+			next, rel, err := parseRelation(buf)
+			if err != nil {
+				return err
+			}
+			rt.state.relations[rel.ID] = rel
+			buf = next
+		case 'I':
+			next, record, err := rt.parseInsert(buf, lsn)
+			if err != nil {
+				return err
+			}
+			buf = next
+			if err := rt.publishRecord(ctx, record); err != nil {
+				rt.logger.Printf("publish INSERT failed: %v", err)
+			}
+		case 'U':
+			next, record, err := rt.parseUpdate(buf, lsn)
+			if err != nil {
+				return err
+			}
+			buf = next
+			if err := rt.publishRecord(ctx, record); err != nil {
+				rt.logger.Printf("publish UPDATE failed: %v", err)
+			}
+		case 'D':
+			next, record, err := rt.parseDelete(buf, lsn)
+			if err != nil {
+				return err
+			}
+			buf = next
+			if err := rt.publishRecord(ctx, record); err != nil {
+				rt.logger.Printf("publish DELETE failed: %v", err)
+			}
+		case 'T':
+			next, records, err := rt.parseTruncate(buf, lsn)
+			if err != nil {
+				return err
+			}
+			buf = next
+			for _, rec := range records {
+				if err := rt.publishRecord(ctx, rec); err != nil {
+					rt.logger.Printf("publish TRUNCATE failed: %v", err)
+				}
+			}
+		case 'O':
+			// Origin message: commit_lsn + origin name.
+			if len(buf) < 8 {
+				return errors.New("short ORIGIN message")
+			}
+			_, rem, ok := parseCString(buf[8:])
+			if !ok {
+				return errors.New("invalid ORIGIN cstring")
+			}
+			buf = rem
+		default:
+			// Skip unsupported message types to keep stream alive.
+			return nil
+		}
+	}
+	return nil
+}
+
+func parseRelation(buf []byte) ([]byte, relationMeta, error) {
+	if len(buf) < 7 {
+		return nil, relationMeta{}, errors.New("short RELATION header")
+	}
+	relID := binary.BigEndian.Uint32(buf[0:4])
+	rem := buf[4:]
+
+	schema, rem2, ok := parseCString(rem)
+	if !ok {
+		return nil, relationMeta{}, errors.New("invalid RELATION schema")
+	}
+	table, rem3, ok := parseCString(rem2)
+	if !ok {
+		return nil, relationMeta{}, errors.New("invalid RELATION table")
+	}
+	if len(rem3) < 3 {
+		return nil, relationMeta{}, errors.New("short RELATION column header")
+	}
+	rem3 = rem3[1:] // replica identity
+	colCount := int(binary.BigEndian.Uint16(rem3[0:2]))
+	rem3 = rem3[2:]
+
+	cols := make([]relationColumn, 0, colCount)
+	for i := 0; i < colCount; i++ {
+		if len(rem3) < 1 {
+			return nil, relationMeta{}, errors.New("short RELATION column flags")
+		}
+		rem3 = rem3[1:] // flags
+		colName, rem4, ok := parseCString(rem3)
+		if !ok {
+			return nil, relationMeta{}, errors.New("invalid RELATION column name")
+		}
+		if len(rem4) < 8 {
+			return nil, relationMeta{}, errors.New("short RELATION column type")
+		}
+		typeOID := binary.BigEndian.Uint32(rem4[0:4])
+		rem3 = rem4[8:] // oid + modifier
+		cols = append(cols, relationColumn{Name: colName, TypeOID: typeOID})
+	}
+
+	return rem3, relationMeta{ID: relID, Schema: schema, Table: table, Columns: cols}, nil
+}
+
+func (rt *runtime) parseInsert(buf []byte, lsn uint64) ([]byte, walRecord, error) {
+	if len(buf) < 5 {
+		return nil, walRecord{}, errors.New("short INSERT")
+	}
+	relID := binary.BigEndian.Uint32(buf[0:4])
+	tag := buf[4]
+	if tag != 'N' {
+		return nil, walRecord{}, errors.New("invalid INSERT tuple tag")
+	}
+	rem, row, err := rt.parseTuple(buf[5:], relID)
+	if err != nil {
+		return nil, walRecord{}, err
+	}
+	rel := rt.lookupRelation(relID)
+	return rem, walRecord{
+		LSN:          lsn,
+		TableSchema:  rel.Schema,
+		TableName:    rel.Table,
+		Operation:    "Insert",
+		OID:          relID,
+		NewTuple:     row,
+		OldTuple:     nil,
+		TxCommitTime: rt.state.txn.CommitTime,
+		TxXID:        rt.state.txn.XID,
+	}, nil
+}
+
+func (rt *runtime) parseUpdate(buf []byte, lsn uint64) ([]byte, walRecord, error) {
+	if len(buf) < 5 {
+		return nil, walRecord{}, errors.New("short UPDATE")
+	}
+	relID := binary.BigEndian.Uint32(buf[0:4])
+	rem := buf[4:]
+
+	var oldRow *rowData
+	tag := rem[0]
+	rem = rem[1:]
+	if tag == 'K' || tag == 'O' {
+		next, parsedOld, err := rt.parseTuple(rem, relID)
+		if err != nil {
+			return nil, walRecord{}, err
+		}
+		oldRow = parsedOld
+		if len(next) < 1 {
+			return nil, walRecord{}, errors.New("missing UPDATE new tuple tag")
+		}
+		tag = next[0]
+		rem = next[1:]
+	} else {
+		rem = rem
+	}
+
+	if tag != 'N' {
+		return nil, walRecord{}, errors.New("invalid UPDATE new tuple tag")
+	}
+	next, newRow, err := rt.parseTuple(rem, relID)
+	if err != nil {
+		return nil, walRecord{}, err
+	}
+
+	rel := rt.lookupRelation(relID)
+	return next, walRecord{
+		LSN:          lsn,
+		TableSchema:  rel.Schema,
+		TableName:    rel.Table,
+		Operation:    "Update",
+		OID:          relID,
+		NewTuple:     newRow,
+		OldTuple:     oldRow,
+		TxCommitTime: rt.state.txn.CommitTime,
+		TxXID:        rt.state.txn.XID,
+	}, nil
+}
+
+func (rt *runtime) parseDelete(buf []byte, lsn uint64) ([]byte, walRecord, error) {
+	if len(buf) < 5 {
+		return nil, walRecord{}, errors.New("short DELETE")
+	}
+	relID := binary.BigEndian.Uint32(buf[0:4])
+	tag := buf[4]
+	if tag != 'K' && tag != 'O' {
+		return nil, walRecord{}, errors.New("invalid DELETE tuple tag")
+	}
+	rem, row, err := rt.parseTuple(buf[5:], relID)
+	if err != nil {
+		return nil, walRecord{}, err
+	}
+	rel := rt.lookupRelation(relID)
+	return rem, walRecord{
+		LSN:          lsn,
+		TableSchema:  rel.Schema,
+		TableName:    rel.Table,
+		Operation:    "Delete",
+		OID:          relID,
+		NewTuple:     nil,
+		OldTuple:     row,
+		TxCommitTime: rt.state.txn.CommitTime,
+		TxXID:        rt.state.txn.XID,
+	}, nil
+}
+
+func (rt *runtime) parseTruncate(buf []byte, lsn uint64) ([]byte, []walRecord, error) {
+	if len(buf) < 5 {
+		return nil, nil, errors.New("short TRUNCATE")
+	}
+	count := int(binary.BigEndian.Uint32(buf[0:4]))
+	rem := buf[5:] // skip options byte
+	if len(rem) < count*4 {
+		return nil, nil, errors.New("short TRUNCATE rel list")
+	}
+	records := make([]walRecord, 0, count)
+	for i := 0; i < count; i++ {
+		relID := binary.BigEndian.Uint32(rem[i*4 : i*4+4])
+		rel := rt.lookupRelation(relID)
+		records = append(records, walRecord{
+			LSN:          lsn,
+			TableSchema:  rel.Schema,
+			TableName:    rel.Table,
+			Operation:    "Truncate",
+			OID:          relID,
+			TxCommitTime: rt.state.txn.CommitTime,
+			TxXID:        rt.state.txn.XID,
+		})
+	}
+	return rem[count*4:], records, nil
+}
+
+func (rt *runtime) parseTuple(buf []byte, relID uint32) ([]byte, *rowData, error) {
+	if len(buf) < 2 {
+		return nil, nil, errors.New("short tuple")
+	}
+	count := int(binary.BigEndian.Uint16(buf[0:2]))
+	rem := buf[2:]
+	rel := rt.lookupRelation(relID)
+
+	cols := make([]column, 0, count)
+	for i := 0; i < count; i++ {
+		if len(rem) < 1 {
+			return nil, nil, errors.New("short tuple column tag")
+		}
+		tag := rem[0]
+		rem = rem[1:]
+
+		name := "col" + strconv.Itoa(i+1)
+		typeID := uint32(0)
+		if i < len(rel.Columns) {
+			name = rel.Columns[i].Name
+			typeID = rel.Columns[i].TypeOID
+		}
+
+		col := column{Name: name, TypeID: typeID}
+		switch tag {
+		case 'n':
+			col.IsNull = true
+		case 'u':
+			col.Value = nil
+			col.IsNull = false
+		case 't':
+			if len(rem) < 4 {
+				return nil, nil, errors.New("short tuple text length")
+			}
+			ln := int(binary.BigEndian.Uint32(rem[0:4]))
+			rem = rem[4:]
+			if len(rem) < ln {
+				return nil, nil, errors.New("short tuple text bytes")
+			}
+			col.Value = string(rem[:ln])
+			col.IsNull = false
+			rem = rem[ln:]
+		default:
+			return nil, nil, errors.New("unsupported tuple tag")
+		}
+		cols = append(cols, col)
+	}
+
+	return rem, &rowData{Columns: cols}, nil
+}
+
+func (rt *runtime) lookupRelation(relID uint32) relationMeta {
+	if rel, ok := rt.state.relations[relID]; ok {
+		return rel
+	}
+	return relationMeta{ID: relID, Schema: "public", Table: strconv.FormatUint(uint64(relID), 10)}
+}
+
+func (rt *runtime) publishRecord(ctx context.Context, record walRecord) error {
+	topic := rt.cfg.topicPrefix + "." + record.TableSchema + "." + record.TableName
+	operation := strings.ToLower(record.Operation)
+	key := []byte(strconv.FormatUint(uint64(record.TxXID), 10))
+	payload, err := json.Marshal(record)
+	if err != nil {
+		rt.stats.failed.Add(1)
+		rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
+		return err
+	}
+
+	start := time.Now()
+	var lastErr error
+	backoff := 10 * time.Millisecond
+	for i := 0; i < 6; i++ {
+		writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		lastErr = rt.writer.WriteMessages(writeCtx, kafka.Message{Topic: topic, Key: key, Value: payload})
+		cancel()
+		if lastErr == nil {
+			rt.stats.published.Add(1)
+			rt.m.publishedRecords.WithLabelValues(operation, topic).Inc()
+			rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
+			return nil
+		}
+		time.Sleep(backoff)
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
+	}
+	rt.stats.failed.Add(1)
+	rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
+	rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
+	return lastErr
+}
+
+func (rt *runtime) logStats(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	var lastPublished uint64
+	var lastFailed uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			published := rt.stats.published.Load()
+			failed := rt.stats.failed.Load()
+			rt.logger.Printf(
+				"stats: ready=%t published_total=%d published_delta=%d failed_total=%d failed_delta=%d",
+				rt.ready.Load(),
+				published,
+				published-lastPublished,
+				failed,
+				failed-lastFailed,
+			)
+			lastPublished = published
+			lastFailed = failed
+		}
+	}
+}
+
+func slotLostError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToUpper(err.Error())
+	return strings.Contains(s, "SQLSTATE 55000") || strings.Contains(s, "CAN NO LONGER GET CHANGES FROM REPLICATION SLOT")
+}
+
+func (rt *runtime) resetReplicationSlot(ctx context.Context) error {
+	adminConnStr := "host=" + rt.cfg.pgHost +
+		" port=" + rt.cfg.pgPort +
+		" user=" + rt.cfg.pgUser +
+		" password=" + rt.cfg.pgPassword +
+		" dbname=" + rt.cfg.pgDatabase
+
+	adminConn, err := pgconn.Connect(ctx, adminConnStr)
+	if err != nil {
+		return err
+	}
+	defer adminConn.Close(context.Background())
+
+	slotName := strings.ReplaceAll(rt.cfg.pgSlotName, "'", "''")
+	dropSQL := "SELECT pg_drop_replication_slot('" + slotName + "') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slotName + "' AND active = false)"
+	createSQL := "SELECT pg_create_logical_replication_slot('" + slotName + "', 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slotName + "')"
+
+	if _, err := adminConn.Exec(ctx, dropSQL).ReadAll(); err != nil {
+		return err
+	}
+	if _, err := adminConn.Exec(ctx, createSQL).ReadAll(); err != nil {
+		return err
+	}
+
+	rt.m.slotResets.Inc()
+	rt.logger.Printf("replication slot %s reset complete", rt.cfg.pgSlotName)
+	return nil
+}
+
+func parseCString(buf []byte) (string, []byte, bool) {
+	idx := bytes.IndexByte(buf, 0)
+	if idx < 0 {
+		return "", nil, false
+	}
+	return string(buf[:idx]), buf[idx+1:], true
+}

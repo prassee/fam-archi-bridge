@@ -8,6 +8,30 @@ use rdkafka::message::Message;
 use tracing::{error, info};
 use wal_common::AppConfig;
 
+fn refresh_subscription(
+    consumer: &StreamConsumer,
+    topic_prefix: &str,
+    subscribed_topics: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut discovered = discover_topics(consumer, topic_prefix)?;
+    discovered.sort();
+
+    if discovered.is_empty() {
+        return Ok(());
+    }
+
+    if discovered != *subscribed_topics {
+        let refs: Vec<&str> = discovered.iter().map(String::as_str).collect();
+        consumer
+            .subscribe(&refs)
+            .context("Failed to refresh Kafka topic subscription")?;
+        info!("Updated Kafka topic subscription: {:?}", discovered);
+        *subscribed_topics = discovered;
+    }
+
+    Ok(())
+}
+
 fn init_logging() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let _ = tracing_subscriber::fmt()
@@ -52,10 +76,11 @@ async fn main() -> anyhow::Result<()> {
         .create()
         .context("Failed to create Kafka consumer")?;
 
-    let topics = loop {
-        let topics = discover_topics(&consumer, config.kafka.topic_prefix())?;
-        if !topics.is_empty() {
-            break topics;
+    let mut topics = loop {
+        let mut discovered = discover_topics(&consumer, config.kafka.topic_prefix())?;
+        discovered.sort();
+        if !discovered.is_empty() {
+            break discovered;
         }
 
         info!(
@@ -76,8 +101,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut stream = consumer.stream();
-    while let Some(message) = stream.next().await {
-        match message {
+    let mut refresh_tick = tokio::time::interval(Duration::from_secs(15));
+
+    loop {
+        tokio::select! {
+            _ = refresh_tick.tick() => {
+                if let Err(err) = refresh_subscription(&consumer, config.kafka.topic_prefix(), &mut topics) {
+                    error!("Failed to refresh topics: {}", err);
+                }
+            }
+            maybe_message = stream.next() => {
+                let Some(message) = maybe_message else {
+                    break;
+                };
+                match message {
             Ok(message) => {
                 let key = message
                     .key_view::<str>()
@@ -105,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(err) => {
                 error!("Kafka consume error: {}", err);
+            }
+                }
             }
         }
     }
