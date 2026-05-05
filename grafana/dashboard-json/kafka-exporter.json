@@ -379,6 +379,83 @@
         "x": 12,
         "y": 20
       }
+    },
+    {
+      "title": "Consumer Lag by Topic (wal-consumer-console)",
+      "description": "Real consumer lag per topic \u2014 requires wal-consumer to be committing offsets. Shows 'No data' when consumer is idle.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"wal-consumer-console\",topic!=\"__consumer_offsets\"}) by (topic)",
+          "legendFormat": "lag {{topic}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Consumer Lag Rate (msgs/sec catching up)",
+      "description": "Rate of change in consumer lag \u2014 negative means consumer is catching up, positive means falling behind.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_consumergroup_lag{consumergroup=\"wal-consumer-console\",topic!=\"__consumer_offsets\"}[1m])) by (topic)",
+          "legendFormat": "lag rate {{topic}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     }
   ]
 }
