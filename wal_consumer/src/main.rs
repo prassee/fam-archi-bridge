@@ -5,9 +5,11 @@ use futures::StreamExt;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wal_common::AppConfig;
 
+const COMMIT_EVERY_MESSAGES: u64 = 500;
+const COMMIT_EVERY_SECS: u64 = 1;
 fn refresh_subscription(
     consumer: &StreamConsumer,
     topic_prefix: &str,
@@ -41,8 +43,7 @@ fn init_logging() {
 }
 
 fn kafka_group_id() -> String {
-    std::env::var("WAL_CONSUMER_GROUP_ID")
-        .unwrap_or_else(|_| "wal-consumer-console".to_string())
+    std::env::var("WAL_CONSUMER_GROUP_ID").unwrap_or_else(|_| "wal-consumer-console".to_string())
 }
 
 fn discover_topics(consumer: &StreamConsumer, topic_prefix: &str) -> anyhow::Result<Vec<String>> {
@@ -54,7 +55,9 @@ fn discover_topics(consumer: &StreamConsumer, topic_prefix: &str) -> anyhow::Res
         .topics()
         .iter()
         .map(|topic| topic.name())
-        .filter(|name| name.starts_with(topic_prefix) && name.as_bytes().get(topic_prefix.len()) == Some(&b'.'))
+        .filter(|name| {
+            name.starts_with(topic_prefix) && name.as_bytes().get(topic_prefix.len()) == Some(&b'.')
+        })
         .map(str::to_string)
         .collect())
 }
@@ -71,7 +74,9 @@ async fn main() -> anyhow::Result<()> {
         .set("group.id", &group_id)
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("session.timeout.ms", "6000")
+        .set("session.timeout.ms", "60000") // 60s timeout for group coordination
+        .set("heartbeat.interval.ms", "2000") // 2s heartbeats (faster failure detection)
+        .set("max.poll.interval.ms", "300000") // 5m max time between polls
         .set("enable.partition.eof", "false")
         .create()
         .context("Failed to create Kafka consumer")?;
@@ -102,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stream = consumer.stream();
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(15));
+    let mut pending_commit_messages: u64 = 0;
+    let mut last_commit_at = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -128,17 +135,34 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or("");
 
                 info!(
-                    "Consumed message topic={} partition={} offset={} key={} payload={}",
+                    "Consumed message topic={} partition={} offset={} key={} payload_bytes={}",
                     message.topic(),
                     message.partition(),
                     message.offset(),
                     key,
-                    payload
+                    payload.len()
                 );
 
-                consumer
-                    .commit_message(&message, CommitMode::Async)
-                    .context("Failed to commit Kafka message")?;
+                pending_commit_messages += 1;
+                let should_commit = pending_commit_messages >= COMMIT_EVERY_MESSAGES
+                    || last_commit_at.elapsed() >= Duration::from_secs(COMMIT_EVERY_SECS);
+
+                if should_commit {
+                    match consumer.commit_consumer_state(CommitMode::Async) {
+                        Ok(_) => {
+                            info!("Committed {} messages to Kafka", pending_commit_messages);
+                            pending_commit_messages = 0;
+                            last_commit_at = tokio::time::Instant::now();
+                        }
+                        Err(err) => {
+                            // Commit failed but we still reset counters to retry with fresh batch
+                            // Async commits are automatically retried by rdkafka
+                            warn!("Kafka offset commit failed (will retry): {}", err);
+                            pending_commit_messages = 0;
+                            last_commit_at = tokio::time::Instant::now();
+                        }
+                    }
+                }
             }
             Err(err) => {
                 error!("Kafka consume error: {}", err);

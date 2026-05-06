@@ -42,7 +42,7 @@ spec:
           value: "PLAINTEXT://0.0.0.0:9092"
         - name: KAFKA_ADVERTISED_LISTENERS
           value: "PLAINTEXT://kafka.cdc.svc.cluster.local:9092"
-        - name: KAFKA_OFFSET_TOPIC_REPLICATION_FACTOR
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
           value: "1"
         - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
           value: "1"

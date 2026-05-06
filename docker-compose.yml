@@ -55,7 +55,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
-      KAFKA_OFFSET_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_LOG_DIRS: "/var/lib/kafka/data"
@@ -192,7 +192,10 @@ services:
       - |
         set -e
         mkdir -p /var/lib/grafana/dashboards
-        curl -fsSL "https://grafana.com/api/dashboards/7589/revisions/1/download" -o /var/lib/grafana/dashboards/kafka-exporter.json || true
+        # Use local dashboard if available, otherwise download
+        if [ ! -f /var/lib/grafana/dashboards/kafka-exporter.json ]; then
+          curl -fsSL "https://grafana.com/api/dashboards/7589/revisions/1/download" -o /var/lib/grafana/dashboards/kafka-exporter.json || true
+        fi
         /run.sh
     volumes:
       - grafana-data:/var/lib/grafana
