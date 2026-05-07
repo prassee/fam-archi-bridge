@@ -259,6 +259,32 @@ wal-writer (:9090/metrics) ───────────┘
 - Metrics endpoint remains on `:9090` with `/health` and `/ready`
 - Use Docker Compose profile `deprecated-rust` only when validating legacy fallback
 
+## Known Issues
+
+The following issues were identified in the full codebase review (May 2026). Ordered by severity.
+
+| # | File | Severity | Issue |
+|---|------|----------|-------|
+| 1 | `wal_writer_go/main.go` | **Critical** | LSN ACK sent before Kafka delivery confirmed — data loss on crash (at-most-once semantics) |
+| 2 | `wal_writer_go/main.go` | **Critical** | Synchronous blocking Kafka writes in the WAL replication hot path — replication slot drops under Kafka backpressure |
+| 3 | `wal_writer_go/main.go` | **High** | SQL injection surface in `resetReplicationSlot` — slot name interpolated via naive `'`-escaping instead of parameterised query |
+| 4 | `wal_writer_go/main.go` | **High** | DELETE rows are incomplete when table `REPLICA IDENTITY` is not `FULL` — non-PK columns are silently null in CDC events |
+| 5 | `wal_writer_go/main.go` | **Medium** | Database password leaks into log output through pgconn connection error messages |
+| 6 | `wal_writer_go/main.go` | **Medium** | Dead assignment `rem = rem` in `parseUpdate` on unrecognised tuple tag — buffer position not advanced, causes misparsing of subsequent columns |
+| 7 | `wal_writer_go/main.go` | **Medium** | Publish retry loop does not check `ctx.Err()` before sleeping — delays graceful shutdown by up to 30 s |
+| 8 | `wal_writer_go/main.go` | **Medium** | `runReplication` calls itself recursively on slot-loss — unbounded stack growth under repeated failures |
+| 9 | `wal_writer_go/main.go` | **Low** | WAL message type labels in Prometheus metrics are raw bytes (`B`, `C`, …) instead of human-readable names |
+| 10 | `wal_writer_go/main.go` | **Low** | `BatchSize` not set on Kafka writer — defaults to 100, negating `lingerMs` batching at high throughput |
+| 11 | `wal_consumer/src/main.rs` | **High** | `fetch_metadata` is a blocking call inside the Tokio async executor — stalls all async tasks for up to 5 s |
+| 12 | `wal_consumer/src/main.rs` | **High** | `std::thread::sleep` used in initial topic discovery loop — blocks the Tokio runtime thread |
+| 13 | `wal_consumer/src/main.rs` | **Medium** | Offset commit counters reset on failure — delays retry commit and can widen uncommitted offset window |
+| 14 | `wal_consumer/src/main.rs` | **Medium** | No graceful shutdown (SIGTERM / Ctrl-C) — uncommitted offsets lost when container is stopped |
+| 15 | `wal_consumer/src/main.rs` | **Low** | Full UTF-8 decode (`payload_view::<str>()`) on every message only to log `payload.len()` — use `payload().map_or(0, \|p\| p.len())` |
+| 16 | `data_pump_go/main.go` | **Medium** | `ORDER BY random() LIMIT $1` for update sampling is an O(N) full table scan + sort — severe I/O at millions of rows |
+| 17 | `data_pump_go/main.go` | **Medium** | Row-by-row `UPDATE` in a loop — N separate round trips per ticker tick; use `UPDATE … WHERE id = ANY($1)` |
+| 18 | `data_pump_go/main.go` | **Medium** | Default `pgxpool` max connections (4) too small for 27 concurrent worker goroutines — connection starvation under load |
+| 19 | `data_pump_go/main.go` | **Low** | `updateRandomRecords` function is defined but never called — dead code |
+
 ## Next Steps
 
 1. Start Phase 3 table writer implementation
