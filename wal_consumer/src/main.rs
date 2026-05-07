@@ -10,12 +10,12 @@ use wal_common::AppConfig;
 
 const COMMIT_EVERY_MESSAGES: u64 = 500;
 const COMMIT_EVERY_SECS: u64 = 1;
-fn refresh_subscription(
+async fn refresh_subscription(
     consumer: &StreamConsumer,
     topic_prefix: &str,
     subscribed_topics: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let mut discovered = discover_topics(consumer, topic_prefix)?;
+    let mut discovered = discover_topics(consumer, topic_prefix).await?;
     discovered.sort();
 
     if discovered.is_empty() {
@@ -46,17 +46,23 @@ fn kafka_group_id() -> String {
     std::env::var("WAL_CONSUMER_GROUP_ID").unwrap_or_else(|_| "wal-consumer-console".to_string())
 }
 
-fn discover_topics(consumer: &StreamConsumer, topic_prefix: &str) -> anyhow::Result<Vec<String>> {
-    let metadata = consumer
-        .fetch_metadata(None, Duration::from_secs(5))
-        .context("Failed to fetch Kafka metadata")?;
+async fn discover_topics(consumer: &StreamConsumer, topic_prefix: &str) -> anyhow::Result<Vec<String>> {
+    let consumer = consumer.clone();
+    let topic_prefix = topic_prefix.to_string();
+    let metadata = tokio::task::spawn_blocking(move || {
+        consumer
+            .fetch_metadata(None, Duration::from_secs(5))
+            .context("Failed to fetch Kafka metadata")
+    })
+    .await
+    .context("Metadata fetch task failed")??;
 
     Ok(metadata
         .topics()
         .iter()
         .map(|topic| topic.name())
         .filter(|name| {
-            name.starts_with(topic_prefix) && name.as_bytes().get(topic_prefix.len()) == Some(&b'.')
+            name.starts_with(&topic_prefix) && name.as_bytes().get(topic_prefix.len()) == Some(&b'.')
         })
         .map(str::to_string)
         .collect())
@@ -82,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to create Kafka consumer")?;
 
     let mut topics = loop {
-        let mut discovered = discover_topics(&consumer, config.kafka.topic_prefix())?;
+        let mut discovered = discover_topics(&consumer, config.kafka.topic_prefix()).await?;
         discovered.sort();
         if !discovered.is_empty() {
             break discovered;
@@ -92,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             "No Kafka topics found for prefix {}, waiting for CDC topics...",
             config.kafka.topic_prefix()
         );
-        std::thread::sleep(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(5)).await;
     };
 
     let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
@@ -113,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = refresh_tick.tick() => {
-                if let Err(err) = refresh_subscription(&consumer, config.kafka.topic_prefix(), &mut topics) {
+                if let Err(err) = refresh_subscription(&consumer, config.kafka.topic_prefix(), &mut topics).await {
                     error!("Failed to refresh topics: {}", err);
                 }
             }

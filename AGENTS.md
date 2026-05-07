@@ -267,23 +267,23 @@ The following issues were identified in the full codebase review (May 2026). Ord
 |---|------|----------|-------|
 | 1 | `wal_writer_go/main.go` | **Critical** | LSN ACK sent before Kafka delivery confirmed — data loss on crash (at-most-once semantics) |
 | 2 | `wal_writer_go/main.go` | **Critical** | Synchronous blocking Kafka writes in the WAL replication hot path — replication slot drops under Kafka backpressure |
-| 3 | `wal_writer_go/main.go` | **High** | SQL injection surface in `resetReplicationSlot` — slot name interpolated via naive `'`-escaping instead of parameterised query |
-| 4 | `wal_writer_go/main.go` | **High** | DELETE rows are incomplete when table `REPLICA IDENTITY` is not `FULL` — non-PK columns are silently null in CDC events |
+| 3 | `wal_writer_go/main.go` | **High** | ✅ Fixed: SQL injection surface in `resetReplicationSlot` — now uses parameterised execution (`ExecParams`) for slot name |
+| 4 | `wal_writer_go/main.go` | **High** | ✅ Fixed: DELETE rows are incomplete when table `REPLICA IDENTITY` is not `FULL` — now emits `partial_old_tuple` based on relation replica identity |
 | 5 | `wal_writer_go/main.go` | **Medium** | Database password leaks into log output through pgconn connection error messages |
 | 6 | `wal_writer_go/main.go` | **Medium** | Dead assignment `rem = rem` in `parseUpdate` on unrecognised tuple tag — buffer position not advanced, causes misparsing of subsequent columns |
 | 7 | `wal_writer_go/main.go` | **Medium** | Publish retry loop does not check `ctx.Err()` before sleeping — delays graceful shutdown by up to 30 s |
 | 8 | `wal_writer_go/main.go` | **Medium** | `runReplication` calls itself recursively on slot-loss — unbounded stack growth under repeated failures |
 | 9 | `wal_writer_go/main.go` | **Low** | WAL message type labels in Prometheus metrics are raw bytes (`B`, `C`, …) instead of human-readable names |
 | 10 | `wal_writer_go/main.go` | **Low** | `BatchSize` not set on Kafka writer — defaults to 100, negating `lingerMs` batching at high throughput |
-| 11 | `wal_consumer/src/main.rs` | **High** | `fetch_metadata` is a blocking call inside the Tokio async executor — stalls all async tasks for up to 5 s |
-| 12 | `wal_consumer/src/main.rs` | **High** | `std::thread::sleep` used in initial topic discovery loop — blocks the Tokio runtime thread |
+| 11 | `wal_consumer/src/main.rs` | **High** | ✅ Fixed: `fetch_metadata` no longer blocks Tokio runtime — moved into `tokio::task::spawn_blocking` |
+| 12 | `wal_consumer/src/main.rs` | **High** | ✅ Fixed: replaced `std::thread::sleep` in async flow with `tokio::time::sleep(...).await` |
 | 13 | `wal_consumer/src/main.rs` | **Medium** | Offset commit counters reset on failure — delays retry commit and can widen uncommitted offset window |
 | 14 | `wal_consumer/src/main.rs` | **Medium** | No graceful shutdown (SIGTERM / Ctrl-C) — uncommitted offsets lost when container is stopped |
 | 15 | `wal_consumer/src/main.rs` | **Low** | Full UTF-8 decode (`payload_view::<str>()`) on every message only to log `payload.len()` — use `payload().map_or(0, \|p\| p.len())` |
-| 16 | `data_pump_go/main.go` | **Medium** | `ORDER BY random() LIMIT $1` for update sampling is an O(N) full table scan + sort — severe I/O at millions of rows |
-| 17 | `data_pump_go/main.go` | **Medium** | Row-by-row `UPDATE` in a loop — N separate round trips per ticker tick; use `UPDATE … WHERE id = ANY($1)` |
-| 18 | `data_pump_go/main.go` | **Medium** | Default `pgxpool` max connections (4) too small for 27 concurrent worker goroutines — connection starvation under load |
-| 19 | `data_pump_go/main.go` | **Low** | `updateRandomRecords` function is defined but never called — dead code |
+| 16 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: removed `ORDER BY random()` sampling in update paths (switched to `TABLESAMPLE`) |
+| 17 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: replaced row-by-row UPI updates with batched `UPDATE ... WHERE transaction_id = ANY($1)` |
+| 18 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: configured pool max connections to 30 via `pgxpool.Config` |
+| 19 | `data_pump_go/main.go` | **Low** | ✅ Fixed: wired `updateRandomRecords` into periodic UPI update ticker |
 
 ## Code Review Details
 
@@ -309,6 +309,8 @@ Fix: Decouple WAL parsing from Kafka publishing. Parse WAL messages into a buffe
 
 **Issue 3 — SQL injection in `resetReplicationSlot` (High)**
 
+Status: ✅ Fixed in `wal_writer_go/main.go` using `pgconn.ExecParams` with `$1` parameter binding.
+
 The slot name is interpolated via naive single-quote escaping:
 ```go
 slotName := strings.ReplaceAll(rt.cfg.pgSlotName, "'", "''")
@@ -319,6 +321,8 @@ This is an SQL injection surface. Use parameterised queries via `pgconn.Exec` wi
 ---
 
 **Issue 4 — Incomplete DELETE rows when REPLICA IDENTITY is not FULL (High)**
+
+Status: ✅ Fixed in `wal_writer_go/main.go` by persisting relation replica identity and emitting `partial_old_tuple` in DELETE events when identity is not `f`.
 
 When a table has `REPLICA IDENTITY DEFAULT` (primary key only), pgoutput sends an `O` tuple tag for the old row containing only PK columns. `parseTuple` will silently produce incomplete column data (nulls for non-PK columns) without signalling this to consumers. Downstream consumers receive partial rows for deletes.
 
@@ -397,6 +401,8 @@ At 10 k msg/sec, batches fill and flush every 100 messages regardless of linger 
 
 **Issue 11 — `fetch_metadata` blocks Tokio executor (High)**
 
+Status: ✅ Fixed in `wal_consumer/src/main.rs` by moving metadata fetch into `tokio::task::spawn_blocking`.
+
 ```rust
 let metadata = consumer.fetch_metadata(None, Duration::from_secs(5));  // synchronous
 ```
@@ -405,6 +411,8 @@ This is a synchronous blocking call inside a `#[tokio::main]` async runtime. Und
 ---
 
 **Issue 12 — `std::thread::sleep` in async context (High)**
+
+Status: ✅ Fixed in `wal_consumer/src/main.rs` by replacing with `tokio::time::sleep(...).await`.
 
 ```rust
 std::thread::sleep(Duration::from_secs(5));  // in #[tokio::main]
@@ -447,6 +455,8 @@ The full UTF-8 decode allocates and validates on every message even though only 
 
 **Issue 16 — `ORDER BY random()` is O(N) full table scan (Medium)**
 
+Status: ✅ Fixed in `data_pump_go/main.go` by replacing random-order sampling with `TABLESAMPLE` in update selectors.
+
 ```go
 SELECT transaction_id FROM upi_transactions ORDER BY random() LIMIT $1
 ```
@@ -455,6 +465,8 @@ At millions of rows, this performs a full sequential scan + sort-by-random every
 ---
 
 **Issue 17 — Row-by-row UPDATE loop (Medium)**
+
+Status: ✅ Fixed in `data_pump_go/main.go` by using a batched update with `WHERE transaction_id = ANY($1)`.
 
 ```go
 for _, id := range txnIDs {
@@ -466,11 +478,15 @@ Each update is a separate round trip. With `numUpdates` potentially in the thous
 
 **Issue 18 — Default pool size too small for concurrent workers (Medium)**
 
+Status: ✅ Fixed in `data_pump_go/main.go` by setting `pgxpool` max connections to 30 via parsed pool config.
+
 `pgxpool.New` uses the default max pool size of 4 connections. With 10 UPI workers + 10 user workers + 3 subscription workers + 2 offer workers + 2 update ticker goroutines = 27 concurrent database workers competing for 4 connections, connection starvation occurs under load. Set `pool_max_conns` in the connection string or via `pgxpool.Config` to at least 30.
 
 ---
 
 **Issue 19 — `updateRandomRecords` is dead code (Low)**
+
+Status: ✅ Fixed in `data_pump_go/main.go` by wiring UPI update ticker to call `updateRandomRecords` periodically.
 
 The function `updateRandomRecords` at the bottom of `data_pump_go/main.go` is defined but never called — all update paths use `updateRandomUsers` and `updateRandomSubscriptions`. Either remove it or wire it to the UPI transaction update path (which currently has no update workers despite being the primary table).
 
@@ -513,3 +529,7 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Capped PostgreSQL WAL retention to 5GB in Docker Compose using `max_wal_size` and `max_slot_wal_keep_size`.
 - Converted WAL Writer runtime container from Rust to Go for active development.
 - Deprecated Rust WAL Writer component and moved it behind an opt-in Docker Compose profile.
+- Fixed high-severity SQL injection in replication slot reset by parameterising slot-name SQL in `wal_writer_go/main.go`.
+- Fixed high-severity DELETE partial-row ambiguity by tracking relation replica identity and emitting `partial_old_tuple` in CDC delete events.
+- Fixed high-severity Tokio blocking behavior in `wal_consumer/src/main.rs` by using `spawn_blocking` for metadata fetch and async sleep in discovery loop.
+- Fixed data pump scale issues by removing `ORDER BY random()` sampling, batching UPI updates, increasing pool max conns, and wiring UPI update ticker.

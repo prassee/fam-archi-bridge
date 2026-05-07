@@ -36,6 +36,7 @@ type appConfig struct {
 	topicPrefix string
 	acks        string
 	lingerMs    int
+	batchSize   int
 	pollMs      int
 }
 
@@ -45,10 +46,11 @@ type relationColumn struct {
 }
 
 type relationMeta struct {
-	ID      uint32
-	Schema  string
-	Table   string
-	Columns []relationColumn
+	ID              uint32
+	Schema          string
+	Table           string
+	ReplicaIdentity byte
+	Columns         []relationColumn
 }
 
 type txnState struct {
@@ -69,15 +71,16 @@ type rowData struct {
 }
 
 type walRecord struct {
-	LSN          uint64   `json:"lsn"`
-	TableSchema  string   `json:"table_schema"`
-	TableName    string   `json:"table_name"`
-	Operation    string   `json:"operation"`
-	OID          uint32   `json:"oid"`
-	NewTuple     *rowData `json:"new_tuple"`
-	OldTuple     *rowData `json:"old_tuple"`
-	TxCommitTime int64    `json:"tx_commit_time"`
-	TxXID        uint32   `json:"tx_xid"`
+	LSN             uint64   `json:"lsn"`
+	TableSchema     string   `json:"table_schema"`
+	TableName       string   `json:"table_name"`
+	Operation       string   `json:"operation"`
+	OID             uint32   `json:"oid"`
+	NewTuple        *rowData `json:"new_tuple"`
+	OldTuple        *rowData `json:"old_tuple"`
+	PartialOldTuple bool     `json:"partial_old_tuple,omitempty"`
+	TxCommitTime    int64    `json:"tx_commit_time"`
+	TxXID           uint32   `json:"tx_xid"`
 }
 
 type cdcState struct {
@@ -86,13 +89,15 @@ type cdcState struct {
 }
 
 type runtime struct {
-	logger *log.Logger
-	cfg    appConfig
-	ready  atomic.Bool
-	writer *kafka.Writer
-	state  cdcState
-	stats  writerStats
-	m      *walMetrics
+	logger       *log.Logger
+	cfg          appConfig
+	ready        atomic.Bool
+	writer       *kafka.Writer
+	state        cdcState
+	stats        writerStats
+	recordQueue  chan walRecord
+	confirmedLSN atomic.Uint64
+	m            *walMetrics
 }
 
 type writerStats struct {
@@ -212,6 +217,7 @@ func loadConfig() appConfig {
 		topicPrefix: readEnv("WAL_WRITER_KAFKA_TOPIC_PREFIX", "cdc"),
 		acks:        readEnv("WAL_WRITER_KAFKA_ACKS", "all"),
 		lingerMs:    readEnvInt("WAL_WRITER_KAFKA_LINGER_MS", 5),
+		batchSize:   readEnvInt("WAL_WRITER_KAFKA_BATCH_SIZE", 16384),
 		pollMs:      readEnvInt("WAL_WRITER_REPLICATION_POLL_INTERVAL_MS", 100),
 	}
 }
@@ -241,6 +247,7 @@ func newRuntime(cfg appConfig, logger *log.Logger) *runtime {
 		Balancer:               &kafka.Hash{},
 		RequiredAcks:           kafka.RequireAll,
 		BatchTimeout:           time.Duration(cfg.lingerMs) * time.Millisecond,
+		BatchSize:              cfg.batchSize,
 		AllowAutoTopicCreation: true,
 	}
 	if strings.EqualFold(cfg.acks, "1") {
@@ -258,6 +265,7 @@ func newRuntime(cfg appConfig, logger *log.Logger) *runtime {
 		state: cdcState{
 			relations: map[uint32]relationMeta{},
 		},
+		recordQueue: make(chan walRecord, cfg.batchSize),
 	}
 	rt.m.ready.Set(0)
 	rt.m.replicationConnected.Set(0)
@@ -316,9 +324,7 @@ func main() {
 
 func (rt *runtime) runReplication(ctx context.Context) error {
 	defer rt.m.replicationLoopExits.Inc()
-	rt.m.replicationConnected.Set(0)
-	rt.ready.Store(false)
-	rt.m.ready.Set(0)
+	go rt.publisher(ctx)
 
 	connStr := "host=" + rt.cfg.pgHost +
 		" port=" + rt.cfg.pgPort +
@@ -327,123 +333,140 @@ func (rt *runtime) runReplication(ctx context.Context) error {
 		" dbname=" + rt.cfg.pgDatabase +
 		" replication=database"
 
-	conn, err := pgconn.Connect(ctx, connStr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close(context.Background())
-
-	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
-	if err != nil {
-		return err
-	}
-	rt.m.replicationConnected.Set(1)
-	defer rt.m.replicationConnected.Set(0)
-	rt.logger.Printf("replication connected: systemid=%s timeline=%d xlogpos=%s db=%s", sysident.SystemID, sysident.Timeline, sysident.XLogPos.String(), sysident.DBName)
-
-	pluginArgs := []string{
-		"proto_version '1'",
-		"publication_names '" + rt.cfg.publication + "'",
-	}
-	if err := pglogrepl.StartReplication(ctx, conn, rt.cfg.pgSlotName, pglogrepl.LSN(0), pglogrepl.StartReplicationOptions{PluginArgs: pluginArgs}); err != nil {
-		if slotLostError(err) {
-			rt.logger.Printf("replication slot appears lost, attempting recreation: %v", err)
-			if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
-				return errors.Join(err, resetErr)
-			}
-			if err = pglogrepl.StartReplication(ctx, conn, rt.cfg.pgSlotName, pglogrepl.LSN(0), pglogrepl.StartReplicationOptions{PluginArgs: pluginArgs}); err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-	rt.ready.Store(true)
-	rt.m.ready.Set(1)
-	rt.logger.Printf("started logical replication slot=%s publication=%s", rt.cfg.pgSlotName, rt.cfg.publication)
-
-	standbyTimeout := 10 * time.Second
-	nextStatus := time.Now().Add(standbyTimeout)
-
-	var lastLSN pglogrepl.LSN
-
+outer:
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		if time.Now().After(nextStatus) {
-			err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
-				WALWritePosition: lastLSN,
-				WALFlushPosition: lastLSN,
-				WALApplyPosition: lastLSN,
-			})
-			if err != nil {
-				return err
-			}
-			nextStatus = time.Now().Add(standbyTimeout)
+		rt.m.replicationConnected.Set(0)
+		rt.ready.Store(false)
+		rt.m.ready.Set(0)
+
+		conn, err := pgconn.Connect(ctx, connStr)
+		if err != nil {
+			return err
 		}
 
-		recvCtx, cancelRecv := context.WithTimeout(ctx, time.Duration(rt.cfg.pollMs)*time.Millisecond)
-		msg, recvErr := conn.ReceiveMessage(recvCtx)
-		cancelRecv()
+		sysident, err := pglogrepl.IdentifySystem(ctx, conn)
+		if err != nil {
+			conn.Close(context.Background())
+			return err
+		}
+		rt.m.replicationConnected.Set(1)
+		rt.logger.Printf("replication connected: systemid=%s timeline=%d xlogpos=%s db=%s", sysident.SystemID, sysident.Timeline, sysident.XLogPos.String(), sysident.DBName)
 
-		if recvErr != nil {
-			if pgconn.Timeout(recvErr) || errors.Is(recvErr, context.DeadlineExceeded) || errors.Is(recvErr, context.Canceled) {
+		pluginArgs := []string{
+			"proto_version '1'",
+			"publication_names '" + rt.cfg.publication + "'",
+		}
+		if err := pglogrepl.StartReplication(ctx, conn, rt.cfg.pgSlotName, pglogrepl.LSN(0), pglogrepl.StartReplicationOptions{PluginArgs: pluginArgs}); err != nil {
+			if slotLostError(err) {
+				rt.logger.Printf("replication slot appears lost, attempting recreation: %v", err)
+				if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
+					conn.Close(context.Background())
+					rt.m.replicationConnected.Set(0)
+					return errors.Join(err, resetErr)
+				}
+				conn.Close(context.Background())
+				rt.m.replicationConnected.Set(0)
+				continue outer
+			}
+			conn.Close(context.Background())
+			rt.m.replicationConnected.Set(0)
+			return err
+		}
+		rt.ready.Store(true)
+		rt.m.ready.Set(1)
+		rt.logger.Printf("started logical replication slot=%s publication=%s", rt.cfg.pgSlotName, rt.cfg.publication)
+
+		standbyTimeout := 10 * time.Second
+		nextStatus := time.Now().Add(standbyTimeout)
+		var lastReceiveLSN pglogrepl.LSN
+
+		for {
+			if ctx.Err() != nil {
+				conn.Close(context.Background())
+				rt.m.replicationConnected.Set(0)
+				return nil
+			}
+
+			if time.Now().After(nextStatus) {
+				confirmedLSN := pglogrepl.LSN(rt.confirmedLSN.Load())
+				err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
+					WALWritePosition: lastReceiveLSN,
+					WALFlushPosition: confirmedLSN,
+					WALApplyPosition: confirmedLSN,
+				})
+				if err != nil {
+					conn.Close(context.Background())
+					return err
+				}
+				nextStatus = time.Now().Add(standbyTimeout)
+			}
+
+			recvCtx, cancelRecv := context.WithTimeout(ctx, time.Duration(rt.cfg.pollMs)*time.Millisecond)
+			msg, recvErr := conn.ReceiveMessage(recvCtx)
+			cancelRecv()
+
+			if recvErr != nil {
+				if pgconn.Timeout(recvErr) || errors.Is(recvErr, context.DeadlineExceeded) || errors.Is(recvErr, context.Canceled) {
+					continue
+				}
+				if slotLostError(recvErr) {
+					rt.logger.Printf("replication slot lost during receive, resetting slot")
+					if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
+						conn.Close(context.Background())
+						rt.m.replicationConnected.Set(0)
+						return errors.Join(recvErr, resetErr)
+					}
+					conn.Close(context.Background())
+					continue outer
+				}
+				conn.Close(context.Background())
+				rt.m.replicationConnected.Set(0)
+				return recvErr
+			}
+
+			copyData, ok := msg.(*pgproto3.CopyData)
+			if !ok || len(copyData.Data) == 0 {
 				continue
 			}
-			if slotLostError(recvErr) {
-				rt.logger.Printf("replication slot lost during receive, resetting slot")
-				if resetErr := rt.resetReplicationSlot(ctx); resetErr != nil {
-					return errors.Join(recvErr, resetErr)
+
+			switch copyData.Data[0] {
+			case pglogrepl.PrimaryKeepaliveMessageByteID:
+				rt.m.walMessages.WithLabelValues("keepalive").Inc()
+				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(copyData.Data[1:])
+				if err != nil {
+					conn.Close(context.Background())
+					return err
 				}
-				return rt.runReplication(ctx)
+				if pkm.ServerWALEnd > lastReceiveLSN {
+					lastReceiveLSN = pkm.ServerWALEnd
+					rt.m.lastReceiveLSN.Set(float64(lastReceiveLSN))
+				}
+				if pkm.ReplyRequested {
+					nextStatus = time.Time{}
+				}
+			case pglogrepl.XLogDataByteID:
+				rt.m.walMessages.WithLabelValues("xlogdata").Inc()
+				xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
+				if err != nil {
+					conn.Close(context.Background())
+					return err
+				}
+				if xld.ServerWALEnd > lastReceiveLSN {
+					lastReceiveLSN = xld.ServerWALEnd
+					rt.m.lastReceiveLSN.Set(float64(lastReceiveLSN))
+				}
+				rt.m.lastProcessLSN.Set(float64(xld.WALStart))
+				if err := rt.processWALData(ctx, xld.WALData, uint64(xld.WALStart)); err != nil {
+					rt.m.processWALErrors.Inc()
+					rt.logger.Printf("process WAL data error: %v", err)
+					continue
+				}
+				nextStatus = time.Time{} // force immediate StandbyStatusUpdate
 			}
-			return recvErr
-		}
-
-		copyData, ok := msg.(*pgproto3.CopyData)
-		if !ok || len(copyData.Data) == 0 {
-			continue
-		}
-
-		switch copyData.Data[0] {
-		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			rt.m.walMessages.WithLabelValues("keepalive").Inc()
-			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(copyData.Data[1:])
-			if err != nil {
-				return err
-			}
-			if pkm.ServerWALEnd > lastLSN {
-				lastLSN = pkm.ServerWALEnd
-				rt.m.lastReceiveLSN.Set(float64(lastLSN))
-			}
-			if pkm.ReplyRequested {
-				nextStatus = time.Time{}
-			}
-		case pglogrepl.XLogDataByteID:
-			rt.m.walMessages.WithLabelValues("xlogdata").Inc()
-			xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
-			if err != nil {
-				return err
-			}
-			if xld.WALStart > lastLSN {
-				lastLSN = xld.WALStart
-				rt.m.lastReceiveLSN.Set(float64(lastLSN))
-			}
-			rt.m.lastProcessLSN.Set(float64(xld.WALStart))
-			if err := rt.processWALData(ctx, xld.WALData, uint64(xld.WALStart)); err != nil {
-				rt.m.processWALErrors.Inc()
-				rt.logger.Printf("process WAL data error: %v", err)
-			}
-			// ACK the end of this XLogData block to PostgreSQL so confirmed_flush_lsn
-			// advances and WAL can be recycled after successful Kafka publish.
-			if xld.ServerWALEnd > lastLSN {
-				lastLSN = xld.ServerWALEnd
-				rt.m.lastReceiveLSN.Set(float64(lastLSN))
-				rt.m.lastProcessLSN.Set(float64(lastLSN))
-			}
-			nextStatus = time.Time{} // force immediate StandbyStatusUpdate
 		}
 	}
 }
@@ -453,7 +476,7 @@ func (rt *runtime) processWALData(ctx context.Context, wal []byte, lsn uint64) e
 	for len(buf) > 0 {
 		msgType := buf[0]
 		buf = buf[1:]
-		rt.m.walMessages.WithLabelValues(string(msgType)).Inc()
+		rt.m.walMessages.WithLabelValues(walMessageType(msgType)).Inc()
 
 		switch msgType {
 		case 'B':
@@ -552,7 +575,8 @@ func parseRelation(buf []byte) ([]byte, relationMeta, error) {
 	if len(rem3) < 3 {
 		return nil, relationMeta{}, errors.New("short RELATION column header")
 	}
-	rem3 = rem3[1:] // replica identity
+	replicaIdentity := rem3[0]
+	rem3 = rem3[1:]
 	colCount := int(binary.BigEndian.Uint16(rem3[0:2]))
 	rem3 = rem3[2:]
 
@@ -574,7 +598,30 @@ func parseRelation(buf []byte) ([]byte, relationMeta, error) {
 		cols = append(cols, relationColumn{Name: colName, TypeOID: typeOID})
 	}
 
-	return rem3, relationMeta{ID: relID, Schema: schema, Table: table, Columns: cols}, nil
+	return rem3, relationMeta{ID: relID, Schema: schema, Table: table, ReplicaIdentity: replicaIdentity, Columns: cols}, nil
+}
+
+func walMessageType(msgType byte) string {
+	switch msgType {
+	case 'B':
+		return "begin"
+	case 'C':
+		return "commit"
+	case 'R':
+		return "relation"
+	case 'I':
+		return "insert"
+	case 'U':
+		return "update"
+	case 'D':
+		return "delete"
+	case 'T':
+		return "truncate"
+	case 'O':
+		return "origin"
+	default:
+		return "unknown"
+	}
 }
 
 func (rt *runtime) parseInsert(buf []byte, lsn uint64) ([]byte, walRecord, error) {
@@ -626,7 +673,7 @@ func (rt *runtime) parseUpdate(buf []byte, lsn uint64) ([]byte, walRecord, error
 		tag = next[0]
 		rem = next[1:]
 	} else {
-		rem = rem
+		return nil, walRecord{}, errors.New("invalid UPDATE old tuple tag")
 	}
 
 	if tag != 'N' {
@@ -665,16 +712,18 @@ func (rt *runtime) parseDelete(buf []byte, lsn uint64) ([]byte, walRecord, error
 		return nil, walRecord{}, err
 	}
 	rel := rt.lookupRelation(relID)
+	partialOldTuple := rel.ReplicaIdentity != 'f'
 	return rem, walRecord{
-		LSN:          lsn,
-		TableSchema:  rel.Schema,
-		TableName:    rel.Table,
-		Operation:    "Delete",
-		OID:          relID,
-		NewTuple:     nil,
-		OldTuple:     row,
-		TxCommitTime: rt.state.txn.CommitTime,
-		TxXID:        rt.state.txn.XID,
+		LSN:             lsn,
+		TableSchema:     rel.Schema,
+		TableName:       rel.Table,
+		Operation:       "Delete",
+		OID:             relID,
+		NewTuple:        nil,
+		OldTuple:        row,
+		PartialOldTuple: partialOldTuple,
+		TxCommitTime:    rt.state.txn.CommitTime,
+		TxXID:           rt.state.txn.XID,
 	}, nil
 }
 
@@ -759,42 +808,76 @@ func (rt *runtime) lookupRelation(relID uint32) relationMeta {
 	if rel, ok := rt.state.relations[relID]; ok {
 		return rel
 	}
-	return relationMeta{ID: relID, Schema: "public", Table: strconv.FormatUint(uint64(relID), 10)}
+	return relationMeta{ID: relID, Schema: "public", Table: strconv.FormatUint(uint64(relID), 10), ReplicaIdentity: 'd'}
+}
+
+func (rt *runtime) publisher(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record := <-rt.recordQueue:
+			topic := rt.cfg.topicPrefix + "." + record.TableSchema + "." + record.TableName
+			operation := strings.ToLower(record.Operation)
+			key := []byte(strconv.FormatUint(uint64(record.TxXID), 10))
+			payload, err := json.Marshal(record)
+			if err != nil {
+				rt.stats.failed.Add(1)
+				rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
+				continue
+			}
+
+			start := time.Now()
+			var lastErr error
+			backoff := 10 * time.Millisecond
+			for i := 0; i < 6; i++ {
+				writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				lastErr = rt.writer.WriteMessages(writeCtx, kafka.Message{Topic: topic, Key: key, Value: payload})
+				cancel()
+				if lastErr == nil {
+					rt.stats.published.Add(1)
+					rt.m.publishedRecords.WithLabelValues(operation, topic).Inc()
+					rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
+					rt.updateConfirmedLSN(record.LSN)
+					break
+				}
+				if ctx.Err() != nil {
+					lastErr = ctx.Err()
+					break
+				}
+				time.Sleep(backoff)
+				if backoff < 500*time.Millisecond {
+					backoff *= 2
+				}
+			}
+			if lastErr != nil {
+				rt.stats.failed.Add(1)
+				rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
+				rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
+			}
+		}
+	}
+}
+
+func (rt *runtime) updateConfirmedLSN(lsn uint64) {
+	for {
+		current := rt.confirmedLSN.Load()
+		if lsn <= current {
+			return
+		}
+		if rt.confirmedLSN.CompareAndSwap(current, lsn) {
+			return
+		}
+	}
 }
 
 func (rt *runtime) publishRecord(ctx context.Context, record walRecord) error {
-	topic := rt.cfg.topicPrefix + "." + record.TableSchema + "." + record.TableName
-	operation := strings.ToLower(record.Operation)
-	key := []byte(strconv.FormatUint(uint64(record.TxXID), 10))
-	payload, err := json.Marshal(record)
-	if err != nil {
-		rt.stats.failed.Add(1)
-		rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
-		return err
+	select {
+	case rt.recordQueue <- record:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-
-	start := time.Now()
-	var lastErr error
-	backoff := 10 * time.Millisecond
-	for i := 0; i < 6; i++ {
-		writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		lastErr = rt.writer.WriteMessages(writeCtx, kafka.Message{Topic: topic, Key: key, Value: payload})
-		cancel()
-		if lastErr == nil {
-			rt.stats.published.Add(1)
-			rt.m.publishedRecords.WithLabelValues(operation, topic).Inc()
-			rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
-			return nil
-		}
-		time.Sleep(backoff)
-		if backoff < 500*time.Millisecond {
-			backoff *= 2
-		}
-	}
-	rt.stats.failed.Add(1)
-	rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
-	rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
-	return lastErr
 }
 
 func (rt *runtime) logStats(ctx context.Context) {
@@ -846,14 +929,15 @@ func (rt *runtime) resetReplicationSlot(ctx context.Context) error {
 	}
 	defer adminConn.Close(context.Background())
 
-	slotName := strings.ReplaceAll(rt.cfg.pgSlotName, "'", "''")
-	dropSQL := "SELECT pg_drop_replication_slot('" + slotName + "') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slotName + "' AND active = false)"
-	createSQL := "SELECT pg_create_logical_replication_slot('" + slotName + "', 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slotName + "')"
+	dropSQL := "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1 AND active = false)"
+	createSQL := "SELECT pg_create_logical_replication_slot($1, 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)"
 
-	if _, err := adminConn.Exec(ctx, dropSQL).ReadAll(); err != nil {
+	rr := adminConn.ExecParams(ctx, dropSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
+	if _, err := rr.Close(); err != nil {
 		return err
 	}
-	if _, err := adminConn.Exec(ctx, createSQL).ReadAll(); err != nil {
+	rr = adminConn.ExecParams(ctx, createSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
+	if _, err := rr.Close(); err != nil {
 		return err
 	}
 

@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	batchSize     = 500
-	numWorkers    = 10
-	targetPerSec  = 10000
+	batchSize    = 500
+	numWorkers   = 10
+	targetPerSec = 10000
 
 	// Table-specific constants
 	usersBatchSize         = 500
@@ -26,68 +26,68 @@ const (
 	offersPerInsert        = 100
 
 	// Update intervals
-	updateInterval      = 5 * time.Minute
+	updateInterval       = 5 * time.Minute
 	offersInsertInterval = 1 * time.Hour
 )
 
 type Transaction struct {
-	TransactionID       string
-	SenderUPIID         string
-	ReceiverUPIID       string
-	SenderName          string
-	ReceiverName        string
-	Amount              float64
+	TransactionID        string
+	SenderUPIID          string
+	ReceiverUPIID        string
+	SenderName           string
+	ReceiverName         string
+	Amount               float64
 	TransactionTimestamp time.Time
-	Status              string
-	TransactionType     string
-	MerchantCategory    string
-	MerchantName        string
-	PayerAccountNumber  string
-	PayeeAccountNumber  string
-	PayerIFSC           string
-	PayeeIFSC           string
-	TransactionRefID    string
-	ResponseCode        string
-	ResponseMessage     string
-	BankName            string
-	PSPName             string
-	UPITransactionRef   string
-	DeviceID            string
-	Channel             string
-	LocationLatitude    float64
-	LocationLongitude   float64
-	IPAddress           string
-	UserAgent           string
-	AppVersion          string
-	OSType              string
-	OSVersion           string
-	DeviceModel         string
-	DeviceManufacturer  string
-	NetworkType         string
-	Carrier             string
-	TransactionMode     string
-	Checksum            string
-	RetryCount          int
-	ProcessingFee       float64
-	GSTAmount           float64
-	TotalAmount         float64
-	SettlementStatus    string
-	SettlementDate      *time.Time
-	RefundStatus        string
-	RefundAmount        *float64
-	MerchantID          string
-	TerminalID          string
-	CreatedAt           time.Time
+	Status               string
+	TransactionType      string
+	MerchantCategory     string
+	MerchantName         string
+	PayerAccountNumber   string
+	PayeeAccountNumber   string
+	PayerIFSC            string
+	PayeeIFSC            string
+	TransactionRefID     string
+	ResponseCode         string
+	ResponseMessage      string
+	BankName             string
+	PSPName              string
+	UPITransactionRef    string
+	DeviceID             string
+	Channel              string
+	LocationLatitude     float64
+	LocationLongitude    float64
+	IPAddress            string
+	UserAgent            string
+	AppVersion           string
+	OSType               string
+	OSVersion            string
+	DeviceModel          string
+	DeviceManufacturer   string
+	NetworkType          string
+	Carrier              string
+	TransactionMode      string
+	Checksum             string
+	RetryCount           int
+	ProcessingFee        float64
+	GSTAmount            float64
+	TotalAmount          float64
+	SettlementStatus     string
+	SettlementDate       *time.Time
+	RefundStatus         string
+	RefundAmount         *float64
+	MerchantID           string
+	TerminalID           string
+	CreatedAt            time.Time
 }
 
 type User struct {
-	UserID      string
-	SenderName  string
+	UserID       string
+	SenderName   string
 	ReceiverName string
-	Email       string
-	Phone       string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	Email        string
+	Phone        string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type UserSubscription struct {
@@ -252,66 +252,66 @@ func generateTransaction() Transaction {
 	}
 
 	return Transaction{
-		TransactionID:       gofakeit.UUID(),
-		SenderUPIID:         fmt.Sprintf("%s@ybl", gofakeit.Username()),
-		ReceiverUPIID:       fmt.Sprintf("%s@okicici", gofakeit.Username()),
-		SenderName:          gofakeit.Name(),
-		ReceiverName:        gofakeit.Name(),
-		Amount:              amount,
+		TransactionID:        gofakeit.UUID(),
+		SenderUPIID:          fmt.Sprintf("%s@ybl", gofakeit.Username()),
+		ReceiverUPIID:        fmt.Sprintf("%s@okicici", gofakeit.Username()),
+		SenderName:           gofakeit.Name(),
+		ReceiverName:         gofakeit.Name(),
+		Amount:               amount,
 		TransactionTimestamp: now.Add(-time.Duration(rand.Intn(86400)) * time.Second),
-		Status:              status,
-		TransactionType:     txnType,
-		MerchantCategory:    merchantCategory,
-		MerchantName:        gofakeit.Company(),
-		PayerAccountNumber:  gofakeit.Numerify("############"),
-		PayeeAccountNumber:  gofakeit.Numerify("############"),
-		PayerIFSC:           gofakeit.Numerify("????0######"),
-		PayeeIFSC:           gofakeit.Numerify("????0######"),
-		TransactionRefID:    gofakeit.UUID(),
-		ResponseCode:        randomChoice([]string{"00", "01", "99"}),
-		ResponseMessage:     gofakeit.Sentence(3),
-		BankName:            gofakeit.Company(),
-		PSPName:             pspName,
-		UPITransactionRef:   gofakeit.UUID(),
-		DeviceID:            gofakeit.UUID(),
-		Channel:             channel,
-		LocationLatitude:    round(rand.Float64()*180-90, 8),
-		LocationLongitude:   round(rand.Float64()*360-180, 8),
-		IPAddress:           gofakeit.IPv4Address(),
-		UserAgent:           gofakeit.UserAgent(),
-		AppVersion:          fmt.Sprintf("%s.%d", gofakeit.Word(), rand.Intn(5)+1),
-		OSType:              osType,
-		OSVersion:           fmt.Sprintf("%d", rand.Intn(5)+10),
-		DeviceModel:         gofakeit.Word(),
-		DeviceManufacturer:  gofakeit.Company(),
-		NetworkType:         networkType,
-		Carrier:             gofakeit.Company(),
-		TransactionMode:     txnMode,
-		Checksum:            fmt.Sprintf("%x", gofakeit.LetterN(32)),
-		RetryCount:          rand.Intn(4),
-		ProcessingFee:       processingFee,
-		GSTAmount:           gstAmount,
-		TotalAmount:         totalAmount,
-		SettlementStatus:    settlementStatus,
-		SettlementDate:      settlementDate,
-		RefundStatus:        refundStatus,
-		RefundAmount:        refundAmount,
-		MerchantID:          gofakeit.UUID(),
-		TerminalID:          gofakeit.UUID(),
-		CreatedAt:           now,
+		Status:               status,
+		TransactionType:      txnType,
+		MerchantCategory:     merchantCategory,
+		MerchantName:         gofakeit.Company(),
+		PayerAccountNumber:   gofakeit.Numerify("############"),
+		PayeeAccountNumber:   gofakeit.Numerify("############"),
+		PayerIFSC:            gofakeit.Numerify("????0######"),
+		PayeeIFSC:            gofakeit.Numerify("????0######"),
+		TransactionRefID:     gofakeit.UUID(),
+		ResponseCode:         randomChoice([]string{"00", "01", "99"}),
+		ResponseMessage:      gofakeit.Sentence(3),
+		BankName:             gofakeit.Company(),
+		PSPName:              pspName,
+		UPITransactionRef:    gofakeit.UUID(),
+		DeviceID:             gofakeit.UUID(),
+		Channel:              channel,
+		LocationLatitude:     round(rand.Float64()*180-90, 8),
+		LocationLongitude:    round(rand.Float64()*360-180, 8),
+		IPAddress:            gofakeit.IPv4Address(),
+		UserAgent:            gofakeit.UserAgent(),
+		AppVersion:           fmt.Sprintf("%s.%d", gofakeit.Word(), rand.Intn(5)+1),
+		OSType:               osType,
+		OSVersion:            fmt.Sprintf("%d", rand.Intn(5)+10),
+		DeviceModel:          gofakeit.Word(),
+		DeviceManufacturer:   gofakeit.Company(),
+		NetworkType:          networkType,
+		Carrier:              gofakeit.Company(),
+		TransactionMode:      txnMode,
+		Checksum:             fmt.Sprintf("%x", gofakeit.LetterN(32)),
+		RetryCount:           rand.Intn(4),
+		ProcessingFee:        processingFee,
+		GSTAmount:            gstAmount,
+		TotalAmount:          totalAmount,
+		SettlementStatus:     settlementStatus,
+		SettlementDate:       settlementDate,
+		RefundStatus:         refundStatus,
+		RefundAmount:         refundAmount,
+		MerchantID:           gofakeit.UUID(),
+		TerminalID:           gofakeit.UUID(),
+		CreatedAt:            now,
 	}
 }
 
 func generateUser() User {
 	now := time.Now()
 	return User{
-		UserID:      gofakeit.UUID(),
-		SenderName:  gofakeit.FirstName(),
+		UserID:       gofakeit.UUID(),
+		SenderName:   gofakeit.FirstName(),
 		ReceiverName: gofakeit.LastName(),
-		Email:       gofakeit.Email(),
-		Phone:       gofakeit.Phone(),
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Email:        gofakeit.Email(),
+		Phone:        gofakeit.Phone(),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 }
 
@@ -608,6 +608,31 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}()
 
+	// Update goroutines - UPI transactions: 20-50% of records every 5 minutes
+	txnUpdateTicker := time.NewTicker(updateInterval)
+	defer txnUpdateTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-txnUpdateTicker.C:
+				var count int
+				pool.QueryRow(ctx, "SELECT COUNT(*) FROM upi_transactions").Scan(&count)
+				if count > 0 {
+					updatePct := 0.2 + rand.Float64()*0.3
+					numUpdates := int(float64(count) * updatePct)
+					if numUpdates < 100 {
+						numUpdates = 100
+					}
+					updated := updateRandomRecords(ctx, pool, numUpdates)
+					totalUpdated.Add(int64(updated))
+					fmt.Printf("Updated %d transaction records (total updates: %d)\n", updated, totalUpdated.Load())
+				}
+			}
+		}
+	}()
+
 	// Subscription insert ticker - 4000 every 5 minutes
 	subInsertTicker := time.NewTicker(updateInterval)
 	defer subInsertTicker.Stop()
@@ -692,10 +717,9 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 }
 
 func updateRandomRecords(ctx context.Context, pool *pgxpool.Pool, count int) int {
-	// Get random transaction IDs to update
 	rows, err := pool.Query(ctx, `
 		SELECT transaction_id FROM upi_transactions
-		ORDER BY random()
+		TABLESAMPLE SYSTEM (10)
 		LIMIT $1
 	`, count)
 	if err != nil {
@@ -718,43 +742,35 @@ func updateRandomRecords(ctx context.Context, pool *pgxpool.Pool, count int) int
 		return 0
 	}
 
-	// Generate update data for each transaction
 	now := time.Now()
-	updated := 0
+	status := randomChoice([]string{"SUCCESS", "FAILED", "PENDING"})
+	settlementStatus := randomChoice([]string{"SETTLED", "PENDING", "FAILED"})
+	refundStatus := randomChoice([]string{"NONE", "INITIATED", "COMPLETED"})
+	amount := round(rand.Float64()*100000+10, 2)
+	timestamp := now.Add(-time.Duration(rand.Intn(86400)) * time.Second)
 
-	for _, id := range txnIDs {
-		status := randomChoice([]string{"SUCCESS", "FAILED", "PENDING"})
-		settlementStatus := randomChoice([]string{"SETTLED", "PENDING", "FAILED"})
-		refundStatus := randomChoice([]string{"NONE", "INITIATED", "COMPLETED"})
-
-		_, err := pool.Exec(ctx, `
-			UPDATE upi_transactions
-			SET status = $1,
-				settlement_status = $2,
-				refund_status = $3,
-				amount = $4,
-				transaction_timestamp = $5,
-				updated_at = $6
-			WHERE transaction_id = $7
-		`, status, settlementStatus, refundStatus,
-			round(rand.Float64()*100000+10, 2),
-			now.Add(-time.Duration(rand.Intn(86400))*time.Second),
-			now, id)
-
-		if err != nil {
-			fmt.Printf("Failed to update transaction %s: %v\n", id, err)
-			continue
-		}
-		updated++
+	cmdTag, err := pool.Exec(ctx, `
+		UPDATE upi_transactions
+		SET status = $1,
+			settlement_status = $2,
+			refund_status = $3,
+			amount = $4,
+			transaction_timestamp = $5,
+			updated_at = $6
+		WHERE transaction_id = ANY($7)
+	`, status, settlementStatus, refundStatus, amount, timestamp, now, txnIDs)
+	if err != nil {
+		fmt.Printf("Failed to update transactions: %v\n", err)
+		return 0
 	}
 
-	return updated
+	return int(cmdTag.RowsAffected())
 }
 
 func updateRandomUsers(ctx context.Context, pool *pgxpool.Pool, count int) int {
 	rows, err := pool.Query(ctx, `
 		SELECT user_id FROM users
-		ORDER BY random()
+		TABLESAMPLE SYSTEM (10)
 		LIMIT $1
 	`, count)
 	if err != nil {
@@ -802,7 +818,7 @@ func updateRandomUsers(ctx context.Context, pool *pgxpool.Pool, count int) int {
 func updateRandomSubscriptions(ctx context.Context, pool *pgxpool.Pool, count int) int {
 	rows, err := pool.Query(ctx, `
 		SELECT subscription_id FROM user_subscription
-		ORDER BY random()
+		TABLESAMPLE SYSTEM (10)
 		LIMIT $1
 	`, count)
 	if err != nil {
@@ -863,7 +879,14 @@ func main() {
 	dbName := getEnv("DB_NAME", "postgres")
 
 	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPassword, dbHost, dbPort, dbName)
-	pool, err := pgxpool.New(ctx, connStr)
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		fmt.Printf("Failed to parse database config: %v\n", err)
+		return
+	}
+	cfg.MaxConns = 30
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		return
