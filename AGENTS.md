@@ -285,6 +285,208 @@ The following issues were identified in the full codebase review (May 2026). Ord
 | 18 | `data_pump_go/main.go` | **Medium** | Default `pgxpool` max connections (4) too small for 27 concurrent worker goroutines — connection starvation under load |
 | 19 | `data_pump_go/main.go` | **Low** | `updateRandomRecords` function is defined but never called — dead code |
 
+## Code Review Details
+
+Full findings from the May 2026 codebase review, ordered by file and severity.
+
+### wal_writer_go/main.go
+
+**Issue 1 — LSN ACK advances before Kafka confirms delivery (Critical)**
+
+After processing WAL data, `nextStatus = time.Time{}` forces an immediate standby heartbeat with `lastLSN` set to `xld.ServerWALEnd` — meaning PostgreSQL is told to recycle WAL **before** the Kafka publish finishes. If the process crashes mid-publish, those changes are permanently lost.
+
+Fix: Only advance `lastLSN` and send the standby update after `publishRecord` succeeds. Track a `confirmedLSN` that advances per-record on successful publish, separate from `receivedLSN`.
+
+---
+
+**Issue 2 — Blocking Kafka I/O on replication loop (Critical)**
+
+`processWALData` is synchronous. Every `publishRecord` call blocks the replication loop for up to 5 s × 6 retries = **30 seconds worst case**. During that time no keepalives are sent, the replication connection times out, and PostgreSQL drops the slot.
+
+Fix: Decouple WAL parsing from Kafka publishing. Parse WAL messages into a buffered channel; a separate goroutine pool drains and publishes. Use per-partition or per-table ordering queues to preserve event order within a table.
+
+---
+
+**Issue 3 — SQL injection in `resetReplicationSlot` (High)**
+
+The slot name is interpolated via naive single-quote escaping:
+```go
+slotName := strings.ReplaceAll(rt.cfg.pgSlotName, "'", "''")
+dropSQL := "SELECT pg_drop_replication_slot('" + slotName + "') ..."
+```
+This is an SQL injection surface. Use parameterised queries via `pgconn.Exec` with `$1` placeholders instead.
+
+---
+
+**Issue 4 — Incomplete DELETE rows when REPLICA IDENTITY is not FULL (High)**
+
+When a table has `REPLICA IDENTITY DEFAULT` (primary key only), pgoutput sends an `O` tuple tag for the old row containing only PK columns. `parseTuple` will silently produce incomplete column data (nulls for non-PK columns) without signalling this to consumers. Downstream consumers receive partial rows for deletes.
+
+Fix: Record the replica identity flag from the `R` (Relation) message and attach it to `relationMeta`. In `parseDelete`, set a field like `PartialOldTuple: true` when replica identity is not `f` (full).
+
+---
+
+**Issue 5 — Password leaks into log output (Medium)**
+
+The connection string is built and passed to `pgconn.Connect`. If pgconn logs errors, the password appears in log output. Log connection parameters individually without the password:
+```go
+rt.logger.Printf("connecting to pg=%s:%s db=%s", rt.cfg.pgHost, rt.cfg.pgPort, rt.cfg.pgDatabase)
+```
+
+---
+
+**Issue 6 — Dead `rem = rem` in `parseUpdate` (Medium)**
+
+```go
+} else {
+    rem = rem  // dead assignment — wrong semantics
+}
+```
+If the tuple tag is neither `K`, `O`, nor `N`, the buffer position is not advanced, causing `parseTuple` to misparse subsequent columns. This branch should return an error.
+
+---
+
+**Issue 7 — Publish retry ignores context cancellation (Medium)**
+
+```go
+for i := 0; i < 6; i++ {
+    writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    lastErr = rt.writer.WriteMessages(writeCtx, ...)
+    cancel()
+    if lastErr == nil { return nil }
+    time.Sleep(backoff)  // blocks even if ctx is Done
+```
+When the process is shutting down (SIGTERM), this loop continues sleeping for up to 3 seconds between retries. Add a check before sleeping:
+```go
+if ctx.Err() != nil { return ctx.Err() }
+```
+
+---
+
+**Issue 8 — Recursive `runReplication` on slot-loss (Medium)**
+
+```go
+return rt.runReplication(ctx)  // recursive call
+```
+Each slot-loss event grows the Go call stack by one frame. Under repeated failures this leaks goroutine stack memory. Replace with a `for` loop and `continue`.
+
+---
+
+**Issue 9 — Raw byte WAL message type labels in Prometheus metrics (Low)**
+
+```go
+rt.m.walMessages.WithLabelValues(string(msgType)).Inc()
+```
+`msgType` is a raw byte (`'B'`, `'C'`, `'R'`, etc.). Labels will be single-character strings that are ambiguous in dashboards. Use explicit named labels: `"begin"`, `"commit"`, `"relation"`, `"insert"`, `"update"`, `"delete"`, `"truncate"`.
+
+---
+
+**Issue 10 — `BatchSize` not configured on Kafka writer (Low)**
+
+```go
+writer := &kafka.Writer{
+    BatchTimeout: time.Duration(cfg.lingerMs) * time.Millisecond,
+    // BatchSize not set — defaults to 100 messages
+}
+```
+At 10 k msg/sec, batches fill and flush every 100 messages regardless of linger time, negating the batching effect. Set `BatchSize` from the existing `WAL_WRITER_KAFKA_BATCH_SIZE` config variable.
+
+---
+
+### wal_consumer/src/main.rs
+
+**Issue 11 — `fetch_metadata` blocks Tokio executor (High)**
+
+```rust
+let metadata = consumer.fetch_metadata(None, Duration::from_secs(5));  // synchronous
+```
+This is a synchronous blocking call inside a `#[tokio::main]` async runtime. Under load it blocks the Tokio executor for up to 5 seconds, stalling all async tasks. Move to `spawn_blocking` or use the async metadata API.
+
+---
+
+**Issue 12 — `std::thread::sleep` in async context (High)**
+
+```rust
+std::thread::sleep(Duration::from_secs(5));  // in #[tokio::main]
+```
+Blocks the Tokio runtime thread during initial topic discovery. Replace with `tokio::time::sleep(Duration::from_secs(5)).await`.
+
+---
+
+**Issue 13 — Commit counters reset on failure (Medium)**
+
+```rust
+Err(err) => {
+    warn!("Kafka offset commit failed (will retry): {}", err);
+    pending_commit_messages = 0;        // resets position
+    last_commit_at = tokio::time::Instant::now();
+}
+```
+Resetting `pending_commit_messages` and `last_commit_at` on failure means the next commit won't trigger until another 500 messages or 1 second passes. The uncommitted messages are not tracked, so the retry commit window widens under high lag. Do not reset on failure — let counters continue growing so a retry fires sooner.
+
+---
+
+**Issue 14 — No graceful shutdown (Medium)**
+
+The consumer loop runs until `stream.next()` returns `None` (broker disconnect). There is no SIGTERM/SIGINT handler. On container stop, the process is killed mid-batch without a final commit. Add a `tokio::signal::ctrl_c` listener that triggers a final synchronous `CommitMode::Sync` commit before exit.
+
+---
+
+**Issue 15 — Full UTF-8 decode just to log payload length (Low)**
+
+```rust
+let payload = message.payload_view::<str>()  // full UTF-8 decode every message
+    ...
+info!("... payload_bytes={}", payload.len());  // only size logged
+```
+The full UTF-8 decode allocates and validates on every message even though only the byte count is used. Use `message.payload().map_or(0, |p| p.len())` for zero-copy length.
+
+---
+
+### data_pump_go/main.go
+
+**Issue 16 — `ORDER BY random()` is O(N) full table scan (Medium)**
+
+```go
+SELECT transaction_id FROM upi_transactions ORDER BY random() LIMIT $1
+```
+At millions of rows, this performs a full sequential scan + sort-by-random every 5 minutes per table. At scale this generates massive I/O and WAL amplification on the source database. Use `TABLESAMPLE SYSTEM(n)` or a keyset-based random sample instead.
+
+---
+
+**Issue 17 — Row-by-row UPDATE loop (Medium)**
+
+```go
+for _, id := range txnIDs {
+    pool.Exec(ctx, `UPDATE upi_transactions SET ... WHERE transaction_id = $7`, ..., id)
+```
+Each update is a separate round trip. With `numUpdates` potentially in the thousands, this saturates the connection pool and generates thousands of individual WAL records, amplifying downstream CDC load. Replace with a single `UPDATE ... WHERE transaction_id = ANY($1)` using an array parameter.
+
+---
+
+**Issue 18 — Default pool size too small for concurrent workers (Medium)**
+
+`pgxpool.New` uses the default max pool size of 4 connections. With 10 UPI workers + 10 user workers + 3 subscription workers + 2 offer workers + 2 update ticker goroutines = 27 concurrent database workers competing for 4 connections, connection starvation occurs under load. Set `pool_max_conns` in the connection string or via `pgxpool.Config` to at least 30.
+
+---
+
+**Issue 19 — `updateRandomRecords` is dead code (Low)**
+
+The function `updateRandomRecords` at the bottom of `data_pump_go/main.go` is defined but never called — all update paths use `updateRandomUsers` and `updateRandomSubscriptions`. Either remove it or wire it to the UPI transaction update path (which currently has no update workers despite being the primary table).
+
+---
+
+### docker-compose.yml
+
+**Issue 20 — `KAFKA_ADVERTISED_LISTENERS` hostname collision (Low)**
+
+```yaml
+KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092"
+```
+Both listeners advertise on port `9092` but with different hostnames (`kafka` vs `localhost`). External clients connecting to `localhost:9092` will be redirected to `kafka:9092`, which is not resolvable outside Docker. Consider mapping `PLAINTEXT_HOST` to `localhost:19092` to match the existing `"9092:19092"` port binding.
+
+---
+
 ## Next Steps
 
 1. Start Phase 3 table writer implementation
