@@ -533,3 +533,11 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Fixed high-severity DELETE partial-row ambiguity by tracking relation replica identity and emitting `partial_old_tuple` in CDC delete events.
 - Fixed high-severity Tokio blocking behavior in `wal_consumer/src/main.rs` by using `spawn_blocking` for metadata fetch and async sleep in discovery loop.
 - Fixed data pump scale issues by removing `ORDER BY random()` sampling, batching UPI updates, increasing pool max conns, and wiring UPI update ticker.
+
+## Proceed Immediately 
+- Create a mock consumer in wal-consumer rust project 
+- this should consume msg from kafka and perform merge in into Iceberg tables.
+- Ensure that it can connct to catalogs like AWS Glue or Iceberg REST catalogs 
+- tst for all teh scenarios 
+    - Insert
+    - Upsert / Merge (with the merge condition defined)
