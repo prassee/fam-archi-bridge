@@ -265,21 +265,21 @@ The following issues were identified in the full codebase review (May 2026). Ord
 
 | # | File | Severity | Issue |
 |---|------|----------|-------|
-| 1 | `wal_writer_go/main.go` | **Critical** | LSN ACK sent before Kafka delivery confirmed — data loss on crash (at-most-once semantics) |
-| 2 | `wal_writer_go/main.go` | **Critical** | Synchronous blocking Kafka writes in the WAL replication hot path — replication slot drops under Kafka backpressure |
+| 1 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: LSN ACK now uses `confirmedLSN` — only advances after successful Kafka publish via `publisher()` goroutine |
+| 2 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: WAL parsing decoupled from Kafka I/O via `recordQueue` channel + dedicated `publisher()` goroutine |
 | 3 | `wal_writer_go/main.go` | **High** | ✅ Fixed: SQL injection surface in `resetReplicationSlot` — now uses parameterised execution (`ExecParams`) for slot name |
 | 4 | `wal_writer_go/main.go` | **High** | ✅ Fixed: DELETE rows are incomplete when table `REPLICA IDENTITY` is not `FULL` — now emits `partial_old_tuple` based on relation replica identity |
-| 5 | `wal_writer_go/main.go` | **Medium** | Database password leaks into log output through pgconn connection error messages |
-| 6 | `wal_writer_go/main.go` | **Medium** | Dead assignment `rem = rem` in `parseUpdate` on unrecognised tuple tag — buffer position not advanced, causes misparsing of subsequent columns |
-| 7 | `wal_writer_go/main.go` | **Medium** | Publish retry loop does not check `ctx.Err()` before sleeping — delays graceful shutdown by up to 30 s |
-| 8 | `wal_writer_go/main.go` | **Medium** | `runReplication` calls itself recursively on slot-loss — unbounded stack growth under repeated failures |
-| 9 | `wal_writer_go/main.go` | **Low** | WAL message type labels in Prometheus metrics are raw bytes (`B`, `C`, …) instead of human-readable names |
-| 10 | `wal_writer_go/main.go` | **Low** | `BatchSize` not set on Kafka writer — defaults to 100, negating `lingerMs` batching at high throughput |
+| 5 | `wal_writer_go/main.go` | **Medium** | ✅ Fixed: Database password redacted from pgconn connection error messages via `redactPassword()` helper |
+| 6 | `wal_writer_go/main.go` | **Medium** | ✅ Fixed: `parseUpdate` now returns an error on unrecognised tuple tag — no more silent buffer misparsing |
+| 7 | `wal_writer_go/main.go` | **Medium** | ✅ Fixed: Publish retry loop checks `ctx.Err()` before sleeping — graceful shutdown no longer delayed by up to 30 s |
+| 8 | `wal_writer_go/main.go` | **Medium** | ✅ Fixed: `runReplication` now uses `outer: for {}` loop instead of recursive call — no unbounded stack growth |
+| 9 | `wal_writer_go/main.go` | **Low** | ✅ Fixed: WAL message type labels use human-readable names via `walMessageType()` helper |
+| 10 | `wal_writer_go/main.go` | **Low** | ✅ Fixed: `BatchSize` configured from `WAL_WRITER_KAFKA_BATCH_SIZE` env var (default 16384) |
 | 11 | `wal_consumer/src/main.rs` | **High** | ✅ Fixed: `fetch_metadata` no longer blocks Tokio runtime — moved into `tokio::task::spawn_blocking` |
 | 12 | `wal_consumer/src/main.rs` | **High** | ✅ Fixed: replaced `std::thread::sleep` in async flow with `tokio::time::sleep(...).await` |
-| 13 | `wal_consumer/src/main.rs` | **Medium** | Offset commit counters reset on failure — delays retry commit and can widen uncommitted offset window |
-| 14 | `wal_consumer/src/main.rs` | **Medium** | No graceful shutdown (SIGTERM / Ctrl-C) — uncommitted offsets lost when container is stopped |
-| 15 | `wal_consumer/src/main.rs` | **Low** | Full UTF-8 decode (`payload_view::<str>()`) on every message only to log `payload.len()` — use `payload().map_or(0, \|p\| p.len())` |
+| 13 | `wal_consumer/src/main.rs` | **Medium** | ✅ Fixed: Offset commit counters no longer reset on failure — counters accumulate so retry fires sooner |
+| 14 | `wal_consumer/src/main.rs` | **Medium** | ✅ Fixed: Graceful shutdown via `tokio::signal::ctrl_c()` — final `CommitMode::Sync` commit before exit |
+| 15 | `wal_consumer/src/main.rs` | **Low** | ✅ Fixed: Replaced `payload_view::<str>()` with `message.payload().map_or(0, \|p\| p.len())` — zero-copy length |
 | 16 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: removed `ORDER BY random()` sampling in update paths (switched to `TABLESAMPLE`) |
 | 17 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: replaced row-by-row UPI updates with batched `UPDATE ... WHERE transaction_id = ANY($1)` |
 | 18 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: configured pool max connections to 30 via `pgxpool.Config` |
@@ -293,6 +293,8 @@ Full findings from the May 2026 codebase review, ordered by file and severity.
 
 **Issue 1 — LSN ACK advances before Kafka confirms delivery (Critical)**
 
+Status: ✅ Fixed in `wal_writer_go/main.go` by introducing `confirmedLSN` atomic tracking and a dedicated `publisher()` goroutine. `StandbyStatusUpdate` now sends `confirmedLSN` for both `WALFlushPosition` and `WALApplyPosition`, which only advances after successful Kafka publish.
+
 After processing WAL data, `nextStatus = time.Time{}` forces an immediate standby heartbeat with `lastLSN` set to `xld.ServerWALEnd` — meaning PostgreSQL is told to recycle WAL **before** the Kafka publish finishes. If the process crashes mid-publish, those changes are permanently lost.
 
 Fix: Only advance `lastLSN` and send the standby update after `publishRecord` succeeds. Track a `confirmedLSN` that advances per-record on successful publish, separate from `receivedLSN`.
@@ -300,6 +302,8 @@ Fix: Only advance `lastLSN` and send the standby update after `publishRecord` su
 ---
 
 **Issue 2 — Blocking Kafka I/O on replication loop (Critical)**
+
+Status: ✅ Fixed in `wal_writer_go/main.go` by introducing `recordQueue` buffered channel and a dedicated `publisher()` goroutine. `publishRecord()` now enqueues to the channel; the replication loop is never blocked by Kafka I/O.
 
 `processWALData` is synchronous. Every `publishRecord` call blocks the replication loop for up to 5 s × 6 retries = **30 seconds worst case**. During that time no keepalives are sent, the replication connection times out, and PostgreSQL drops the slot.
 
@@ -331,6 +335,8 @@ Fix: Record the replica identity flag from the `R` (Relation) message and attach
 ---
 
 **Issue 5 — Password leaks into log output (Medium)**
+
+Status: ✅ Fixed in `wal_writer_go/main.go` via `redactPassword()` helper that replaces the literal password in any pgconn error string with `[REDACTED]` before logging.
 
 The connection string is built and passed to `pgconn.Connect`. If pgconn logs errors, the password appears in log output. Log connection parameters individually without the password:
 ```go
@@ -423,6 +429,8 @@ Blocks the Tokio runtime thread during initial topic discovery. Replace with `to
 
 **Issue 13 — Commit counters reset on failure (Medium)**
 
+Status: ✅ Fixed in `wal_consumer/src/main.rs` — the `Err` branch no longer resets `pending_commit_messages` or `last_commit_at`, so pressure accumulates and a retry fires on the very next message or tick.
+
 ```rust
 Err(err) => {
     warn!("Kafka offset commit failed (will retry): {}", err);
@@ -436,11 +444,15 @@ Resetting `pending_commit_messages` and `last_commit_at` on failure means the ne
 
 **Issue 14 — No graceful shutdown (Medium)**
 
+Status: ✅ Fixed in `wal_consumer/src/main.rs` — `tokio::signal::ctrl_c()` is pinned and selected in the main loop. On Ctrl-C or stream end, a final `CommitMode::Sync` commit is issued before the process exits.
+
 The consumer loop runs until `stream.next()` returns `None` (broker disconnect). There is no SIGTERM/SIGINT handler. On container stop, the process is killed mid-batch without a final commit. Add a `tokio::signal::ctrl_c` listener that triggers a final synchronous `CommitMode::Sync` commit before exit.
 
 ---
 
 **Issue 15 — Full UTF-8 decode just to log payload length (Low)**
+
+Status: ✅ Fixed in `wal_consumer/src/main.rs` — replaced `payload_view::<str>()` with `message.payload().map_or(0, |p| p.len())`.
 
 ```rust
 let payload = message.payload_view::<str>()  // full UTF-8 decode every message
@@ -533,6 +545,17 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Fixed high-severity DELETE partial-row ambiguity by tracking relation replica identity and emitting `partial_old_tuple` in CDC delete events.
 - Fixed high-severity Tokio blocking behavior in `wal_consumer/src/main.rs` by using `spawn_blocking` for metadata fetch and async sleep in discovery loop.
 - Fixed data pump scale issues by removing `ORDER BY random()` sampling, batching UPI updates, increasing pool max conns, and wiring UPI update ticker.
+- Fixed critical LSN at-most-once delivery by introducing `confirmedLSN` atomic tracking — PostgreSQL WAL retention position now only advances after successful Kafka publish.
+- Fixed critical blocking Kafka I/O in replication loop by decoupling WAL parsing from publishing via `recordQueue` channel and dedicated `publisher()` goroutine.
+- Fixed `parseUpdate` dead `rem = rem` branch — now returns an error on unrecognised tuple tag to prevent buffer misparsing.
+- Fixed publish retry loop ignoring context cancellation — now checks `ctx.Err()` before each backoff sleep.
+- Fixed recursive `runReplication` on slot-loss — replaced with `outer: for {}` loop and `continue outer`.
+- Fixed raw WAL byte metric labels — `walMessageType()` helper maps bytes to human-readable names.
+- Fixed Kafka `BatchSize` not wired — now reads from `WAL_WRITER_KAFKA_BATCH_SIZE` env var.
+- Fixed password credential leak in log output — `redactPassword()` helper sanitizes pgconn connection error messages before logging.
+- Fixed wal_consumer offset commit counters resetting on failure — counters now accumulate across failures so retry fires sooner.
+- Fixed wal_consumer graceful shutdown — `tokio::signal::ctrl_c()` handler now performs a final synchronous commit before process exit.
+- Fixed wal_consumer unnecessary UTF-8 payload decode — replaced with zero-copy `message.payload().map_or(0, |p| p.len())`.
 
 ## Proceed Immediately 
 - Create a mock consumer in wal-consumer rust project 

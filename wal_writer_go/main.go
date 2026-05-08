@@ -311,7 +311,7 @@ func main() {
 		cancel()
 	case err := <-errCh:
 		if err != nil {
-			logger.Printf("replication loop exited with error: %v", err)
+			logger.Printf("replication loop exited with error: %v", redactPassword(err, cfg.pgPassword))
 		}
 	}
 
@@ -345,7 +345,7 @@ outer:
 
 		conn, err := pgconn.Connect(ctx, connStr)
 		if err != nil {
-			return err
+			return redactPassword(err, rt.cfg.pgPassword)
 		}
 
 		sysident, err := pglogrepl.IdentifySystem(ctx, conn)
@@ -925,7 +925,7 @@ func (rt *runtime) resetReplicationSlot(ctx context.Context) error {
 
 	adminConn, err := pgconn.Connect(ctx, adminConnStr)
 	if err != nil {
-		return err
+		return redactPassword(err, rt.cfg.pgPassword)
 	}
 	defer adminConn.Close(context.Background())
 
@@ -952,4 +952,13 @@ func parseCString(buf []byte) (string, []byte, bool) {
 		return "", nil, false
 	}
 	return string(buf[:idx]), buf[idx+1:], true
+}
+
+// redactPassword replaces a literal password inside error messages to prevent
+// credential leakage when pgconn embeds the full DSN in error text.
+func redactPassword(err error, password string) error {
+	if err == nil || password == "" {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), password, "[REDACTED]"))
 }
