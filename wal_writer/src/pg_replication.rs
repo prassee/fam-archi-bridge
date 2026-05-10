@@ -13,7 +13,7 @@ use crate::metrics::Metrics;
 use crate::state::LsnTracker;
 use crate::wal_parser::WalParser;
 
-use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent};
+use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
 
 pub struct WalReader {
     config: Arc<AppConfig>,
@@ -70,17 +70,19 @@ impl WalReader {
             .await
             .context("Failed to connect replication client")?;
         info!("Connected replication client for slot {}", slot_name);
+        self.metrics.set_replication_connected(true);
 
         let parser = WalParser::new();
         let decoder = self.decoder.clone();
         let lsn_tracker = self.lsn_tracker.clone();
         let metrics = self.metrics.clone();
 
-        let mut total_wal_bytes: u64 = 0;
-        let mut total_records_parsed: u64 = 0;
+        let mut _total_wal_bytes: u64 = 0;
+        let mut _total_records_parsed: u64 = 0;
         let mut total_batches_sent: u64 = 0;
         let mut total_parse_errors: u64 = 0;
-        let mut last_log = Instant::now();
+        let mut _last_log = Instant::now();
+        let mut confirmed_lsn: u64 = 0;
         const LOG_INTERVAL_SECS: u64 = 10;
 
         info!("WAL reader loop started — waiting for replication events");
@@ -99,51 +101,68 @@ impl WalReader {
                     server_time_micros: _,
                 }) => {
                     let bytes = data.len() as u64;
-                    total_wal_bytes += bytes;
+                    _total_wal_bytes += bytes;
                     debug!(
                         "Received XLogData {} bytes at LSN {}",
                         bytes,
                         wal_end.as_u64()
                     );
                     metrics.inc_by(bytes);
-
-                    // Feed back the consumed LSN so PostgreSQL can advance
-                    // confirmed_flush_lsn and reclaim WAL segments.
-                    client.update_applied_lsn(wal_end);
+                    metrics.inc_wal_message("xlogdata");
+                    metrics.set_last_receive_lsn(wal_end.as_u64());
 
                     match parser.parse(&data) {
                         Ok(records) => {
                             let n = records.len();
                             metrics.wal_records_parsed_inc(n as u64);
                             if !records.is_empty() {
-                                total_records_parsed += n as u64;
+                                _total_records_parsed += n as u64;
                                 debug!(
                                     "Parsed {} WAL record(s) from {} bytes at LSN {}",
                                     n,
                                     bytes,
                                     wal_end.as_u64()
                                 );
-                                if let Err(e) = decoder.send_batch(&records).await {
-                                    error!("Failed to send batch to Kafka: {}", e);
-                                } else {
-                                    total_batches_sent += 1;
-                                    debug!(
-                                        "Kafka batch sent: {} record(s) [total batches={}]",
-                                        n, total_batches_sent
-                                    );
-                                }
-                                metrics.batches_sent_inc();
-
-                                if let Some(record) = records.last() {
-                                    let lsn =
-                                        format!("{}/{}", record.lsn >> 32, record.lsn & 0xFFFFFFFF);
-                                    let _ = lsn_tracker.persist(&slot_name, &lsn).await;
+                                match decoder.send_batch(&records).await {
+                                    Ok(Some(highest_lsn)) => {
+                                        total_batches_sent += 1;
+                                        debug!(
+                                            "Kafka batch sent: {} record(s) [total batches={}]",
+                                            n, total_batches_sent
+                                        );
+                                        confirmed_lsn =
+                                            confirmed_lsn.max(highest_lsn).max(wal_end.as_u64());
+                                        client.update_applied_lsn(Lsn(confirmed_lsn));
+                                        metrics.set_last_acked_lsn(confirmed_lsn);
+                                        let lsn = format!(
+                                            "{}/{}",
+                                            confirmed_lsn >> 32,
+                                            confirmed_lsn & 0xFFFFFFFF
+                                        );
+                                        let _ = lsn_tracker.persist(&slot_name, &lsn).await;
+                                        metrics.batches_sent_inc();
+                                    }
+                                    Ok(None) => {
+                                        debug!(
+                                            "XLogData {} bytes contained no WAL records to publish",
+                                            bytes
+                                        );
+                                        confirmed_lsn = confirmed_lsn.max(wal_end.as_u64());
+                                        client.update_applied_lsn(Lsn(confirmed_lsn));
+                                        metrics.set_last_acked_lsn(confirmed_lsn);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to send batch to Kafka: {}", e);
+                                        metrics.process_wal_errors_inc();
+                                    }
                                 }
                             } else {
                                 debug!(
                                     "XLogData {} bytes yielded 0 records (non-DML message)",
                                     bytes
                                 );
+                                confirmed_lsn = confirmed_lsn.max(wal_end.as_u64());
+                                client.update_applied_lsn(Lsn(confirmed_lsn));
                             }
                         }
                         Err(e) => {
@@ -153,19 +172,8 @@ impl WalReader {
                                 bytes, e, total_parse_errors
                             );
                             metrics.parsing_errors_inc();
+                            metrics.process_wal_errors_inc();
                         }
-                    }
-
-                    // Periodic summary log every LOG_INTERVAL_SECS
-                    if last_log.elapsed().as_secs() >= LOG_INTERVAL_SECS {
-                        info!(
-                            "WAL stats — bytes_received={} records_parsed={} batches_sent={} parse_errors={}",
-                            total_wal_bytes,
-                            total_records_parsed,
-                            total_batches_sent,
-                            total_parse_errors
-                        );
-                        last_log = Instant::now();
                     }
                 }
                 Some(ReplicationEvent::Begin {
@@ -173,7 +181,7 @@ impl WalReader {
                     xid: _,
                     commit_time_micros: _,
                 }) => {
-                    // Could use begin event for transactional boundary handling
+                    metrics.inc_wal_message("begin");
                     debug!("Replication begin at {}", final_lsn.as_u64());
                 }
                 Some(ReplicationEvent::Commit {
@@ -181,33 +189,34 @@ impl WalReader {
                     end_lsn,
                     commit_time_micros: _,
                 }) => {
+                    metrics.inc_wal_message("commit");
                     debug!(
                         "Commit at LSN {} (end LSN {}) — flushing LSN feedback",
                         lsn.as_u64(),
                         end_lsn.as_u64()
                     );
-                    // Confirm committed LSN back to PostgreSQL.
-                    client.update_applied_lsn(end_lsn);
-                    let lsn_str = format!(
-                        "{}/{}",
-                        end_lsn.as_u64() >> 32,
-                        end_lsn.as_u64() & 0xFFFFFFFF
-                    );
-                    let _ = lsn_tracker.persist(&slot_name, &lsn_str).await;
+                    if confirmed_lsn > 0 {
+                        client.update_applied_lsn(Lsn(confirmed_lsn));
+                        metrics.set_last_acked_lsn(confirmed_lsn);
+                        let lsn_str =
+                            format!("{}/{}", confirmed_lsn >> 32, confirmed_lsn & 0xFFFFFFFF);
+                        let _ = lsn_tracker.persist(&slot_name, &lsn_str).await;
+                    }
                 }
                 Some(ReplicationEvent::KeepAlive {
                     wal_end,
                     reply_requested,
                     server_time_micros: _,
                 }) => {
+                    metrics.inc_wal_message("keepalive");
                     debug!(
                         "Keepalive at {} reply_requested={}",
                         wal_end.as_u64(),
                         reply_requested
                     );
-                    // Always echo LSN back on keepalive so PostgreSQL knows
-                    // we are alive and have consumed up to wal_end.
-                    client.update_applied_lsn(wal_end);
+                    if confirmed_lsn > 0 && reply_requested {
+                        client.update_applied_lsn(Lsn(confirmed_lsn));
+                    }
                 }
                 Some(ReplicationEvent::Message {
                     transactional: _,
@@ -215,6 +224,7 @@ impl WalReader {
                     prefix,
                     content,
                 }) => {
+                    metrics.inc_wal_message("message");
                     debug!(
                         "Logical message {} at {} prefix={}",
                         content.len(),
@@ -224,6 +234,7 @@ impl WalReader {
                     // treat message content as an event or log it
                 }
                 Some(ReplicationEvent::StoppedAt { reached }) => {
+                    metrics.inc_wal_message("stopped");
                     info!("Replication stopped at {}", reached.as_u64());
                     break;
                 }
@@ -235,6 +246,7 @@ impl WalReader {
             }
         }
 
+        metrics.inc_replication_loop_exits();
         info!("Shutting down WAL reader");
         Ok(())
     }

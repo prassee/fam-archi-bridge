@@ -43,6 +43,12 @@ impl AppConfig {
                     .parse()
                     .unwrap_or(16384),
                 compression: env::var("WAL_WRITER_KAFKA_COMPRESSION").ok(),
+                debug_no_kafka: env::var("WAL_WRITER_DEBUG_NO_KAFKA")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                debug_print_wal: env::var("WAL_WRITER_DEBUG_PRINT_WAL")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             },
             replication: ReplicationConfig {
                 publication: env::var("WAL_WRITER_PUBLICATION")
@@ -92,6 +98,8 @@ pub struct KafkaConfig {
     pub linger_ms: u32,
     pub batch_size: u32,
     pub compression: Option<String>,
+    pub debug_no_kafka: bool,
+    pub debug_print_wal: bool,
 }
 
 impl KafkaConfig {

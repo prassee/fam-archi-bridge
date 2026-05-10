@@ -39,6 +39,17 @@ impl fmt::Display for Operation {
     }
 }
 
+impl Operation {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Operation::Insert => "insert",
+            Operation::Update => "update",
+            Operation::Delete => "delete",
+            Operation::Truncate => "truncate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowData {
     pub columns: Vec<Column>,
@@ -132,16 +143,30 @@ impl WalParser {
                         // reuse RelationInfo via its public constructor that
                         // accepts ColumnInfo (the types are exported). Build a
                         // ColumnInfo compatible struct using the public type.
-                        columns.push(pg_walstream::ColumnInfo::new(flags, name, type_id, type_modifier));
+                        columns.push(pg_walstream::ColumnInfo::new(
+                            flags,
+                            name,
+                            type_id,
+                            type_modifier,
+                        ));
                     }
-                    let rel = RelationInfo::new(relation_id, namespace, relation_name, replica_identity, columns);
+                    let rel = RelationInfo::new(
+                        relation_id,
+                        namespace,
+                        relation_name,
+                        replica_identity,
+                        columns,
+                    );
                     relations.insert(relation_id, rel);
                 }
                 'I' => {
                     let relation_id = reader.read_u32()?;
                     let tuple_type = reader.read_u8()? as char;
                     if tuple_type != 'N' {
-                        return Err(anyhow::anyhow!("unexpected tuple type in INSERT: {}", tuple_type));
+                        return Err(anyhow::anyhow!(
+                            "unexpected tuple type in INSERT: {}",
+                            tuple_type
+                        ));
                     }
                     let row = parse_tuple_to_row(&mut reader, relations.get(&relation_id))?;
                     let (schema, name, oid) = relation_info_for(&relations, relation_id);
@@ -165,12 +190,18 @@ impl WalParser {
                         let peek = reader.peek_u8()? as char;
                         if peek == 'K' || peek == 'O' {
                             let _ = reader.read_u8()?; // consume type
-                            old_row = Some(parse_tuple_to_row(&mut reader, relations.get(&relation_id))?);
+                            old_row = Some(parse_tuple_to_row(
+                                &mut reader,
+                                relations.get(&relation_id),
+                            )?);
                         }
                     }
                     let new_tuple_type = reader.read_u8()? as char;
                     if new_tuple_type != 'N' {
-                        return Err(anyhow::anyhow!("unexpected new tuple type in UPDATE: {}", new_tuple_type));
+                        return Err(anyhow::anyhow!(
+                            "unexpected new tuple type in UPDATE: {}",
+                            new_tuple_type
+                        ));
                     }
                     let new_row = parse_tuple_to_row(&mut reader, relations.get(&relation_id))?;
                     let (schema, name, oid) = relation_info_for(&relations, relation_id);
@@ -245,9 +276,12 @@ fn relation_info_for(relations: &HashMap<u32, RelationInfo>, relid: u32) -> (Str
     }
 }
 
-    // tuple_to_rowdata removed - parser now uses parse_tuple_to_row(reader, relation)
+// tuple_to_rowdata removed - parser now uses parse_tuple_to_row(reader, relation)
 
-fn parse_tuple_to_row(reader: &mut BufferReader, relation: Option<&RelationInfo>) -> Result<RowData> {
+fn parse_tuple_to_row(
+    reader: &mut BufferReader,
+    relation: Option<&RelationInfo>,
+) -> Result<RowData> {
     // mirror parse_tuple_data logic from pg_walstream::protocol
     let column_count = reader.read_u16()? as usize;
     let mut cols: Vec<Column> = Vec::with_capacity(column_count);

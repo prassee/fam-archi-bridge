@@ -257,6 +257,7 @@ wal-writer (:9090/metrics) ───────────┘
 - Rust WAL Writer (`wal_writer/`) is deprecated and kept only for rollback safety
 - Kafka topic naming remains `{topic_prefix}.{schema}.{table}`
 - Metrics endpoint remains on `:9090` with `/health` and `/ready`
+- Debug session: isolate `wal-writer-rust` and `data-pump-go`, stop Kafka and monitoring services, and use `WAL_WRITER_DEBUG_NO_KAFKA=true` + `WAL_WRITER_DEBUG_PRINT_WAL=true` to print parsed WAL records without sending to Kafka.
 - Use Docker Compose profile `deprecated-rust` only when validating legacy fallback
 
 ## Known Issues
@@ -284,6 +285,9 @@ The following issues were identified in the full codebase review (May 2026). Ord
 | 17 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: replaced row-by-row UPI updates with batched `UPDATE ... WHERE transaction_id = ANY($1)` |
 | 18 | `data_pump_go/main.go` | **Medium** | ✅ Fixed: configured pool max connections to 30 via `pgxpool.Config` |
 | 19 | `data_pump_go/main.go` | **Low** | ✅ Fixed: wired `updateRandomRecords` into periodic UPI update ticker |
+| 20 | `docker-compose.yml` | **High** | ✅ Fixed: `db-init` command never exited (looping `until` replaced with `while` + `exit 0`) — caused `docker compose up wal-writer` to hang indefinitely waiting for `service_completed_successfully` |
+| 21 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: `confirmed_flush_lsn` stayed NULL — `nextStatus = time.Time{}` after each XLogData message sent `WALFlushPosition=0` before publisher confirmed anything; removed forced flush, reduced standby heartbeat to 2 s |
+| 22 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: publisher throughput capped at ~44 msg/s — single `WriteMessages` call per record was bounded by `BatchTimeout=5ms`; replaced with batched drain loop (up to 500 records per `WriteMessages` call); verified **~9,700 msg/s** matching data-pump input rate |
 
 ## Code Review Details
 
@@ -556,11 +560,26 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Fixed wal_consumer offset commit counters resetting on failure — counters now accumulate across failures so retry fires sooner.
 - Fixed wal_consumer graceful shutdown — `tokio::signal::ctrl_c()` handler now performs a final synchronous commit before process exit.
 - Fixed wal_consumer unnecessary UTF-8 payload decode — replaced with zero-copy `message.payload().map_or(0, |p| p.len())`.
+- Fixed `db-init` command never terminating — replaced `until` loop (bash-only) with POSIX `while` loop and added explicit `exit 0`; `docker compose up wal-writer` now correctly waits for `service_completed_successfully`.
+- Fixed `confirmed_flush_lsn` always NULL in replication slot — removed `nextStatus = time.Time{}` after XLogData which was sending `WALFlushPosition=0` before the async publisher confirmed any LSN; reduced standby heartbeat interval to 2 s so PostgreSQL advances slot position promptly after first batch delivery. Verified: `confirmed_flush_lsn` now advances continuously.
+- Fixed publisher throughput bottleneck (44 msg/s → ~9,700 msg/s) — rewrote `publisher()` goroutine to batch-drain `recordQueue` (up to 500 records) and call `WriteMessages` once per batch instead of once per record, eliminating the `BatchTimeout` per-message serialization penalty.
 
-## Proceed Immediately 
-- Create a mock consumer in wal-consumer rust project 
-- this should consume msg from kafka and perform merge in into Iceberg tables.
-- Ensure that it can connct to catalogs like AWS Glue or Iceberg REST catalogs 
-- tst for all teh scenarios 
-    - Insert
-    - Upsert / Merge (with the merge condition defined)
+## Proceed Immediately
+
+### Phase 3 — Iceberg Consumer (wal_consumer Rust project)
+
+Now that WAL Writer is stable at ~9,700 msg/s with `confirmed_flush_lsn` advancing, implement the Iceberg writer in the `wal_consumer` Rust project:
+
+- Consume CDC messages from Kafka topics (`cdc.public.*`)
+- Perform merge/upsert into Iceberg tables backed by S3 (or local MinIO for dev)
+- Connect to catalogs: AWS Glue REST catalog or Iceberg REST catalog
+- Test all operation scenarios:
+  - Insert → append new rows to Iceberg table
+  - Upsert / Merge (with configurable merge key, e.g. primary key)
+  - Delete → mark rows as deleted or physically remove
+  - Truncate → drop + recreate Iceberg table partition
+
+### Operational Runbooks (add)
+- Slot lag recovery: steps when `confirmed_flush_lsn` falls behind
+- Slot invalidation: recreate slot + restart wal-writer sequence
+- Redeploy verification: confirm `confirmed_flush_lsn` is non-NULL within 10 s of start

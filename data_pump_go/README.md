@@ -6,7 +6,7 @@ High-throughput UPI transaction data generator for PostgreSQL, written in Go. Po
 
 - Generates realistic UPI transaction data using faker
 - Inserts into PostgreSQL using COPY for high throughput
-- Configurable target transactions per second (default: 10,000)
+- Configurable target transactions per second via `DATA_PUMP_TARGET_PER_SEC`
 - Concurrent batch inserts with worker pool
 - Graceful shutdown on SIGINT
 
@@ -19,6 +19,10 @@ High-throughput UPI transaction data generator for PostgreSQL, written in Go. Po
 | `DB_USER` | `postgres` | PostgreSQL user |
 | `DB_PASSWORD` | `postgres` | PostgreSQL password |
 | `DB_NAME` | `postgres` | Database name |
+| `DATA_PUMP_TARGET_PER_SEC` | `2000` | Target UPI transactions per second |
+| `DATA_PUMP_BATCH_SIZE` | `500` | Number of records per UPI insert batch |
+| `DATA_PUMP_USERS_BATCH_SIZE` | `500` | Number of user records per batch |
+| `DATA_PUMP_NUM_WORKERS` | `10` | Number of concurrent batch insert workers |
 
 ## Build
 
@@ -36,6 +40,9 @@ Or with custom database connection:
 
 ```bash
 DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=postgres ./data_pump_go
+
+# Run at 5k inserts/sec
+DATA_PUMP_TARGET_PER_SEC=5000 DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=postgres ./data_pump_go
 ```
 
 ## Stop

@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         // Wait for at least 64 KiB before the broker returns a fetch response.
         .set("fetch.min.bytes", "65536")
         // Give the broker up to 50 ms to accumulate fetch.min.bytes.
-        .set("fetch.max.wait.ms", "50")
+        .set("fetch.wait.max.ms", "50")
         // Cap total fetch response to 50 MiB so a single round-trip doesn't
         // allocate unboundedly at 1000+ partitions.
         .set("fetch.max.bytes", "52428800")

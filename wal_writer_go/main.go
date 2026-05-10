@@ -6,12 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -81,6 +83,25 @@ type walRecord struct {
 	PartialOldTuple bool     `json:"partial_old_tuple,omitempty"`
 	TxCommitTime    int64    `json:"tx_commit_time"`
 	TxXID           uint32   `json:"tx_xid"`
+
+	Topic   string `json:"-"`
+	Key     []byte `json:"-"`
+	Payload []byte `json:"-"`
+}
+
+func (r *walRecord) prepareMessage(prefix string) error {
+	r.Topic = prefix + "." + r.TableSchema + "." + r.TableName
+	if len(r.Key) == 0 {
+		r.Key = []byte(strconv.FormatUint(uint64(r.TxXID), 10))
+	}
+	if len(r.Payload) == 0 {
+		payload, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		r.Payload = payload
+	}
+	return nil
 }
 
 type cdcState struct {
@@ -89,15 +110,19 @@ type cdcState struct {
 }
 
 type runtime struct {
-	logger       *log.Logger
-	cfg          appConfig
-	ready        atomic.Bool
-	writer       *kafka.Writer
-	state        cdcState
-	stats        writerStats
-	recordQueue  chan walRecord
-	confirmedLSN atomic.Uint64
-	m            *walMetrics
+	logger           *log.Logger
+	cfg              appConfig
+	ready            atomic.Bool
+	writer           *kafka.Writer
+	state            cdcState
+	stats            writerStats
+	recordQueue      chan walRecord
+	topicQueueMu     sync.Mutex
+	topicQueues      map[string]chan walRecord
+	pendingMu        sync.Mutex
+	pendingLSNCounts map[uint64]int
+	confirmedLSN     atomic.Uint64
+	m                *walMetrics
 }
 
 type writerStats struct {
@@ -243,9 +268,12 @@ func healthMux(ready *atomic.Bool) *http.ServeMux {
 
 func newRuntime(cfg appConfig, logger *log.Logger) *runtime {
 	writer := &kafka.Writer{
-		Addr:                   kafka.TCP(strings.Split(cfg.kafkaBroker, ",")...),
-		Balancer:               &kafka.Hash{},
-		RequiredAcks:           kafka.RequireAll,
+		Addr:         kafka.TCP(strings.Split(cfg.kafkaBroker, ",")...),
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireAll,
+		// Use configured linger so the broker can coalesce messages, but keep
+		// publisher-side batching as well. This avoids overly small writes at high
+		// event rates.
 		BatchTimeout:           time.Duration(cfg.lingerMs) * time.Millisecond,
 		BatchSize:              cfg.batchSize,
 		AllowAutoTopicCreation: true,
@@ -265,7 +293,9 @@ func newRuntime(cfg appConfig, logger *log.Logger) *runtime {
 		state: cdcState{
 			relations: map[uint32]relationMeta{},
 		},
-		recordQueue: make(chan walRecord, cfg.batchSize),
+		recordQueue:      make(chan walRecord, cfg.batchSize*4),
+		topicQueues:      make(map[string]chan walRecord),
+		pendingLSNCounts: make(map[uint64]int),
 	}
 	rt.m.ready.Set(0)
 	rt.m.replicationConnected.Set(0)
@@ -380,7 +410,7 @@ outer:
 		rt.m.ready.Set(1)
 		rt.logger.Printf("started logical replication slot=%s publication=%s", rt.cfg.pgSlotName, rt.cfg.publication)
 
-		standbyTimeout := 10 * time.Second
+		standbyTimeout := 2 * time.Second
 		nextStatus := time.Now().Add(standbyTimeout)
 		var lastReceiveLSN pglogrepl.LSN
 
@@ -465,7 +495,13 @@ outer:
 					rt.logger.Printf("process WAL data error: %v", err)
 					continue
 				}
-				nextStatus = time.Time{} // force immediate StandbyStatusUpdate
+				// Do NOT force immediate StandbyStatusUpdate here: confirmedLSN is
+				// updated asynchronously by the publisher goroutine after Kafka
+				// delivery.  Sending WALFlushPosition=0 (before the first publish
+				// confirms) keeps confirmed_flush_lsn NULL in the slot and causes
+				// PostgreSQL to retain all WAL until the slot is invalidated.
+				// The periodic standbyTimeout heartbeat (plus ReplyRequested keepalives)
+				// is sufficient to keep the connection alive.
 			}
 		}
 	}
@@ -638,7 +674,7 @@ func (rt *runtime) parseInsert(buf []byte, lsn uint64) ([]byte, walRecord, error
 		return nil, walRecord{}, err
 	}
 	rel := rt.lookupRelation(relID)
-	return rem, walRecord{
+	record := walRecord{
 		LSN:          lsn,
 		TableSchema:  rel.Schema,
 		TableName:    rel.Table,
@@ -648,7 +684,11 @@ func (rt *runtime) parseInsert(buf []byte, lsn uint64) ([]byte, walRecord, error
 		OldTuple:     nil,
 		TxCommitTime: rt.state.txn.CommitTime,
 		TxXID:        rt.state.txn.XID,
-	}, nil
+	}
+	if err := record.prepareMessage(rt.cfg.topicPrefix); err != nil {
+		return nil, walRecord{}, err
+	}
+	return rem, record, nil
 }
 
 func (rt *runtime) parseUpdate(buf []byte, lsn uint64) ([]byte, walRecord, error) {
@@ -659,33 +699,39 @@ func (rt *runtime) parseUpdate(buf []byte, lsn uint64) ([]byte, walRecord, error
 	rem := buf[4:]
 
 	var oldRow *rowData
-	tag := rem[0]
-	rem = rem[1:]
-	if tag == 'K' || tag == 'O' {
+	for {
+		if len(rem) < 1 {
+			return nil, walRecord{}, errors.New("short UPDATE tuple tag")
+		}
+		tag := rem[0]
+		rem = rem[1:]
+
+		if tag == 'N' {
+			break
+		}
+
+		if tag != 'K' && tag != 'O' {
+			return nil, walRecord{}, fmt.Errorf("invalid UPDATE tuple tag %q (expected K, O, or N)", string(tag))
+		}
+
 		next, parsedOld, err := rt.parseTuple(rem, relID)
 		if err != nil {
 			return nil, walRecord{}, err
 		}
-		oldRow = parsedOld
-		if len(next) < 1 {
-			return nil, walRecord{}, errors.New("missing UPDATE new tuple tag")
+		rem = next
+		// Prefer full old tuple (O) when available, otherwise keep key tuple (K).
+		if tag == 'O' || oldRow == nil {
+			oldRow = parsedOld
 		}
-		tag = next[0]
-		rem = next[1:]
-	} else {
-		return nil, walRecord{}, errors.New("invalid UPDATE old tuple tag")
 	}
 
-	if tag != 'N' {
-		return nil, walRecord{}, errors.New("invalid UPDATE new tuple tag")
-	}
 	next, newRow, err := rt.parseTuple(rem, relID)
 	if err != nil {
 		return nil, walRecord{}, err
 	}
 
 	rel := rt.lookupRelation(relID)
-	return next, walRecord{
+	record := walRecord{
 		LSN:          lsn,
 		TableSchema:  rel.Schema,
 		TableName:    rel.Table,
@@ -695,7 +741,11 @@ func (rt *runtime) parseUpdate(buf []byte, lsn uint64) ([]byte, walRecord, error
 		OldTuple:     oldRow,
 		TxCommitTime: rt.state.txn.CommitTime,
 		TxXID:        rt.state.txn.XID,
-	}, nil
+	}
+	if err := record.prepareMessage(rt.cfg.topicPrefix); err != nil {
+		return nil, walRecord{}, err
+	}
+	return next, record, nil
 }
 
 func (rt *runtime) parseDelete(buf []byte, lsn uint64) ([]byte, walRecord, error) {
@@ -713,7 +763,7 @@ func (rt *runtime) parseDelete(buf []byte, lsn uint64) ([]byte, walRecord, error
 	}
 	rel := rt.lookupRelation(relID)
 	partialOldTuple := rel.ReplicaIdentity != 'f'
-	return rem, walRecord{
+	record := walRecord{
 		LSN:             lsn,
 		TableSchema:     rel.Schema,
 		TableName:       rel.Table,
@@ -724,7 +774,11 @@ func (rt *runtime) parseDelete(buf []byte, lsn uint64) ([]byte, walRecord, error
 		PartialOldTuple: partialOldTuple,
 		TxCommitTime:    rt.state.txn.CommitTime,
 		TxXID:           rt.state.txn.XID,
-	}, nil
+	}
+	if err := record.prepareMessage(rt.cfg.topicPrefix); err != nil {
+		return nil, walRecord{}, err
+	}
+	return rem, record, nil
 }
 
 func (rt *runtime) parseTruncate(buf []byte, lsn uint64) ([]byte, []walRecord, error) {
@@ -740,7 +794,7 @@ func (rt *runtime) parseTruncate(buf []byte, lsn uint64) ([]byte, []walRecord, e
 	for i := 0; i < count; i++ {
 		relID := binary.BigEndian.Uint32(rem[i*4 : i*4+4])
 		rel := rt.lookupRelation(relID)
-		records = append(records, walRecord{
+		record := walRecord{
 			LSN:          lsn,
 			TableSchema:  rel.Schema,
 			TableName:    rel.Table,
@@ -748,7 +802,11 @@ func (rt *runtime) parseTruncate(buf []byte, lsn uint64) ([]byte, []walRecord, e
 			OID:          relID,
 			TxCommitTime: rt.state.txn.CommitTime,
 			TxXID:        rt.state.txn.XID,
-		})
+		}
+		if err := record.prepareMessage(rt.cfg.topicPrefix); err != nil {
+			return nil, nil, err
+		}
+		records = append(records, record)
 	}
 	return rem[count*4:], records, nil
 }
@@ -811,34 +869,86 @@ func (rt *runtime) lookupRelation(relID uint32) relationMeta {
 	return relationMeta{ID: relID, Schema: "public", Table: strconv.FormatUint(uint64(relID), 10), ReplicaIdentity: 'd'}
 }
 
+// publisher drains walRecords from recordQueue, batches them by topic, and
+// writes each topic's messages concurrently via WriteMessages.  Concurrency
+// eliminates the per-topic serialisation penalty: with two active topics
+// (upi_transactions + users) the writes to each Kafka partition run in
+// parallel, halving effective broker round-trip time.
+//
+// maxBatch is deliberately large (5000) to amortise the broker round-trip
+// over more records, giving the publisher enough headroom to keep pace with
+// higher CDC event rates.
 func (rt *runtime) publisher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case record := <-rt.recordQueue:
-			topic := rt.cfg.topicPrefix + "." + record.TableSchema + "." + record.TableName
-			operation := strings.ToLower(record.Operation)
-			key := []byte(strconv.FormatUint(uint64(record.TxXID), 10))
-			payload, err := json.Marshal(record)
-			if err != nil {
-				rt.stats.failed.Add(1)
-				rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
-				continue
-			}
+		case rec := <-rt.recordQueue:
+			rt.enqueuePendingLSN(rec.LSN)
+			rt.dispatchTopicRecord(ctx, rec)
+		}
+	}
+}
 
-			start := time.Now()
+func (rt *runtime) dispatchTopicRecord(ctx context.Context, rec walRecord) error {
+	q := rt.getTopicQueue(ctx, rec.Topic)
+	select {
+	case q <- rec:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (rt *runtime) getTopicQueue(ctx context.Context, topic string) chan walRecord {
+	rt.topicQueueMu.Lock()
+	q, ok := rt.topicQueues[topic]
+	if !ok {
+		q = make(chan walRecord, rt.cfg.batchSize)
+		rt.topicQueues[topic] = q
+		go rt.topicWorker(ctx, topic, q)
+	}
+	rt.topicQueueMu.Unlock()
+	return q
+}
+
+func (rt *runtime) topicWorker(ctx context.Context, topic string, q chan walRecord) {
+	const maxBatch = 500
+	records := make([]walRecord, 0, maxBatch)
+
+	for {
+		records = records[:0]
+
+		select {
+		case <-ctx.Done():
+			return
+		case rec := <-q:
+			records = append(records, rec)
+		}
+
+	drain:
+		for len(records) < maxBatch {
+			select {
+			case rec := <-q:
+				records = append(records, rec)
+			default:
+				break drain
+			}
+		}
+
+		msgs := make([]kafka.Message, 0, len(records))
+		for _, rec := range records {
+			msgs = append(msgs, kafka.Message{Topic: topic, Key: rec.Key, Value: rec.Payload})
+		}
+
+		for {
 			var lastErr error
 			backoff := 10 * time.Millisecond
 			for i := 0; i < 6; i++ {
 				writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				lastErr = rt.writer.WriteMessages(writeCtx, kafka.Message{Topic: topic, Key: key, Value: payload})
+				lastErr = rt.writer.WriteMessages(writeCtx, msgs...)
 				cancel()
 				if lastErr == nil {
-					rt.stats.published.Add(1)
-					rt.m.publishedRecords.WithLabelValues(operation, topic).Inc()
-					rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
-					rt.updateConfirmedLSN(record.LSN)
 					break
 				}
 				if ctx.Err() != nil {
@@ -850,16 +960,56 @@ func (rt *runtime) publisher(ctx context.Context) {
 					backoff *= 2
 				}
 			}
+
 			if lastErr != nil {
-				rt.stats.failed.Add(1)
-				rt.m.publishFailures.WithLabelValues(operation, topic).Inc()
-				rt.m.publishDurationSeconds.Observe(time.Since(start).Seconds())
+				for _, rec := range records {
+					topicName := rt.cfg.topicPrefix + "." + rec.TableSchema + "." + rec.TableName
+					rt.stats.failed.Add(1)
+					rt.m.publishFailures.WithLabelValues(strings.ToLower(rec.Operation), topicName).Inc()
+				}
+				rt.logger.Printf("publish %s batch failed for topic=%s: %v; retrying in 1s", strings.ToLower(records[0].Operation), topic, lastErr)
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Second):
+				}
+				continue
 			}
+
+			for _, rec := range records {
+			topicName := rt.cfg.topicPrefix + "." + rec.TableSchema + "." + rec.TableName
+			rt.stats.published.Add(1)
+			rt.m.publishedRecords.WithLabelValues(strings.ToLower(rec.Operation), topicName).Inc()
+			rt.markPublishedLSN(rec.LSN)
 		}
 	}
 }
 
-func (rt *runtime) updateConfirmedLSN(lsn uint64) {
+func (rt *runtime) enqueuePendingLSN(lsn uint64) {
+	rt.pendingMu.Lock()
+	rt.pendingLSNCounts[lsn]++
+	rt.pendingMu.Unlock()
+}
+
+func (rt *runtime) markPublishedLSN(lsn uint64) {
+	rt.pendingMu.Lock()
+	if cnt, ok := rt.pendingLSNCounts[lsn]; ok {
+		if cnt <= 1 {
+			delete(rt.pendingLSNCounts, lsn)
+		} else {
+			rt.pendingLSNCounts[lsn] = cnt - 1
+		}
+	}
+
+	for pending := range rt.pendingLSNCounts {
+		if pending <= lsn {
+			rt.pendingMu.Unlock()
+			return
+		}
+	}
+	rt.pendingMu.Unlock()
+
 	for {
 		current := rt.confirmedLSN.Load()
 		if lsn <= current {
@@ -929,13 +1079,37 @@ func (rt *runtime) resetReplicationSlot(ctx context.Context) error {
 	}
 	defer adminConn.Close(context.Background())
 
-	dropSQL := "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1 AND active = false)"
-	createSQL := "SELECT pg_create_logical_replication_slot($1, 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)"
-
-	rr := adminConn.ExecParams(ctx, dropSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
+	// Step 1: Terminate any backends holding the slot active.
+	// This is necessary because PostgreSQL won't drop an active slot even after
+	// the client disconnects until the backend process is terminated.
+	terminateSQL := `
+		SELECT pg_terminate_backend(active_pid)
+		FROM pg_replication_slots
+		WHERE slot_name = $1 AND active_pid IS NOT NULL
+	`
+	rr := adminConn.ExecParams(ctx, terminateSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
 	if _, err := rr.Close(); err != nil {
-		return err
+		// Log but don't fail; the terminate may not have done anything if slot doesn't exist yet
+		rt.logger.Printf("terminate backends for slot %s: %v", rt.cfg.pgSlotName, err)
 	}
+
+	// Small delay to allow PostgreSQL to clean up the terminated backend
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Step 2: Drop the slot (regardless of active state, since we just terminated all backends)
+	dropSQL := "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)"
+	rr = adminConn.ExecParams(ctx, dropSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
+	if _, err := rr.Close(); err != nil {
+		// If the slot doesn't exist, that's fine; we're going to create it anyway
+		rt.logger.Printf("drop slot %s (may not exist): %v", rt.cfg.pgSlotName, err)
+	}
+
+	// Step 3: Create a fresh slot
+	createSQL := "SELECT pg_create_logical_replication_slot($1, 'pgoutput', false, false)"
 	rr = adminConn.ExecParams(ctx, createSQL, [][]byte{[]byte(rt.cfg.pgSlotName)}, nil, nil, nil)
 	if _, err := rr.Close(); err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,12 +17,12 @@ import (
 )
 
 const (
-	batchSize    = 500
-	numWorkers   = 10
-	targetPerSec = 10000
+	defaultBatchSize    = 1000
+	defaultNumWorkers   = 20
+	defaultTargetPerSec = 20000
 
 	// Table-specific constants
-	usersBatchSize         = 500
+	usersBatchSize         = 100
 	subscriptionsPerInsert = 4000
 	offersPerInsert        = 100
 
@@ -29,6 +30,13 @@ const (
 	updateInterval       = 5 * time.Minute
 	offersInsertInterval = 1 * time.Hour
 )
+
+type pumpConfig struct {
+	targetPerSec   int
+	batchSize      int
+	usersBatchSize int
+	numWorkers     int
+}
 
 type Transaction struct {
 	TransactionID        string
@@ -374,6 +382,16 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
 func insertBatch(ctx context.Context, pool *pgxpool.Pool, batch []Transaction) int {
 	if len(batch) == 0 {
 		return 0
@@ -491,8 +509,8 @@ func insertOffersBatch(ctx context.Context, pool *pgxpool.Pool, batch []Offer) i
 	return len(batch)
 }
 
-func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
-	interval := float64(batchSize) / float64(targetPerSec)
+func generateLoad(ctx context.Context, pool *pgxpool.Pool, cfg pumpConfig) {
+	interval := float64(cfg.batchSize) / float64(cfg.targetPerSec)
 
 	var totalInserted atomic.Int64
 	var totalUpdated atomic.Int64
@@ -504,10 +522,10 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	startTime := time.Now()
 
 	// Channel for UPI transactions
-	workChan := make(chan []Transaction, numWorkers)
+	workChan := make(chan []Transaction, cfg.numWorkers)
 	var wg sync.WaitGroup
 
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < cfg.numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -519,8 +537,8 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	}
 
 	// Channel for users (fast moving)
-	usersChan := make(chan []User, numWorkers)
-	for i := 0; i < numWorkers; i++ {
+	usersChan := make(chan []User, cfg.numWorkers)
+	for i := 0; i < cfg.numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -670,8 +688,8 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 	}()
 
 	fmt.Printf("Tables created. Generating load:\n")
-	fmt.Printf("  - UPI transactions: %d txns/sec\n", targetPerSec)
-	fmt.Printf("  - Users: %d txns/sec (same as UPI)\n", targetPerSec)
+	fmt.Printf("  - UPI transactions: %d txns/sec\n", cfg.targetPerSec)
+	fmt.Printf("  - Users: %d txns/sec (same as UPI)\n", cfg.targetPerSec)
 	fmt.Printf("  - Subscriptions: %d every 5 minutes\n", subscriptionsPerInsert)
 	fmt.Printf("  - Offers: %d every 1 hour\n", offersPerInsert)
 	fmt.Println("Updates: 20-50% of users and subscriptions every 5 minutes")
@@ -700,15 +718,15 @@ func generateLoad(ctx context.Context, pool *pgxpool.Pool) {
 			return
 		case <-ticker.C:
 			// UPI transactions batch
-			batch := make([]Transaction, batchSize)
-			for i := 0; i < batchSize; i++ {
+			batch := make([]Transaction, cfg.batchSize)
+			for i := 0; i < cfg.batchSize; i++ {
 				batch[i] = generateTransaction()
 			}
 			workChan <- batch
 
 			// Users batch (same rate as UPI transactions)
-			userBatch := make([]User, usersBatchSize)
-			for i := 0; i < usersBatchSize; i++ {
+			userBatch := make([]User, cfg.usersBatchSize)
+			for i := 0; i < cfg.usersBatchSize; i++ {
 				userBatch[i] = generateUser()
 			}
 			usersChan <- userBatch
@@ -878,6 +896,25 @@ func main() {
 	dbPassword := getEnv("DB_PASSWORD", "postgres")
 	dbName := getEnv("DB_NAME", "postgres")
 
+	pumpCfg := pumpConfig{
+		targetPerSec:   getEnvInt("DATA_PUMP_TARGET_PER_SEC", defaultTargetPerSec),
+		batchSize:      getEnvInt("DATA_PUMP_BATCH_SIZE", defaultBatchSize),
+		usersBatchSize: getEnvInt("DATA_PUMP_USERS_BATCH_SIZE", usersBatchSize),
+		numWorkers:     getEnvInt("DATA_PUMP_NUM_WORKERS", defaultNumWorkers),
+	}
+	if pumpCfg.targetPerSec <= 0 {
+		pumpCfg.targetPerSec = defaultTargetPerSec
+	}
+	if pumpCfg.batchSize <= 0 {
+		pumpCfg.batchSize = defaultBatchSize
+	}
+	if pumpCfg.usersBatchSize <= 0 {
+		pumpCfg.usersBatchSize = usersBatchSize
+	}
+	if pumpCfg.numWorkers <= 0 {
+		pumpCfg.numWorkers = defaultNumWorkers
+	}
+
 	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPassword, dbHost, dbPort, dbName)
 	cfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -904,5 +941,5 @@ func main() {
 		cancel()
 	}()
 
-	generateLoad(ctx, pool)
+	generateLoad(ctx, pool, pumpCfg)
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tracing::{debug, error, warn};
 
 use crate::kafka::KafkaProducer;
@@ -21,9 +22,9 @@ impl WalDecoder {
         }
     }
 
-    pub async fn send_batch(&self, records: &[WalRecord]) -> Result<()> {
+    pub async fn send_batch(&self, records: &[WalRecord]) -> Result<Option<u64>> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let mut by_table: std::collections::HashMap<(String, String), Vec<WalRecord>> =
@@ -37,17 +38,20 @@ impl WalDecoder {
                 .push(record.clone());
         }
 
+        let mut highest_lsn = 0u64;
+        let batch_start = std::time::Instant::now();
+
         for ((_schema, _table), table_records) in by_table {
             let topic = format!("{}.{}.{}", self.kafka.topic_prefix(), _schema, _table);
             debug!("Ensuring Kafka topic '{}' exists", topic);
             if let Err(e) = self.kafka.ensure_topic(&topic) {
                 warn!("Failed to ensure topic '{}': {}", topic, e);
+                self.metrics.process_wal_errors_inc();
                 return Err(e);
             }
 
             let count = table_records.len();
             let mut sent = 0usize;
-            let mut failed = 0usize;
             for record in table_records {
                 let key = record.tx_xid.to_string();
                 let value = serde_json::to_string(&record)?;
@@ -61,7 +65,10 @@ impl WalDecoder {
                     match self.kafka.send(&topic, &key, &value) {
                         Ok(()) => {
                             self.metrics.kafka_messages_sent_inc();
+                            self.metrics.published_record_inc(record.operation.clone());
+                            self.metrics.set_last_process_lsn(record.lsn);
                             sent += 1;
+                            highest_lsn = highest_lsn.max(record.lsn);
                             break;
                         }
                         Err(e) => {
@@ -82,22 +89,29 @@ impl WalDecoder {
                                     topic, key, retry_count, e
                                 );
                                 self.metrics.kafka_send_errors_inc();
-                                failed += 1;
-                                break;
+                                self.metrics.publish_failure_inc();
+                                self.metrics.process_wal_errors_inc();
+                                return Err(e.into());
                             }
                         }
                     }
                 }
             }
 
-            debug!(
-                "Kafka topic='{}' sent={} failed={} total={}",
-                topic, sent, failed, count
-            );
+            debug!("Kafka topic='{}' sent={} total={}", topic, sent, count);
             debug!("Sent {} records to topic {}", count, topic);
         }
 
-        Ok(())
+        self.metrics.observe_publish_duration(batch_start.elapsed());
+
+        if let Err(err) = self.kafka.flush(Duration::from_secs(5)) {
+            error!("Kafka flush failed: {}", err);
+            self.metrics.publish_failure_inc();
+            self.metrics.process_wal_errors_inc();
+            return Err(anyhow!("Kafka flush failed: {}", err));
+        }
+
+        Ok(Some(highest_lsn))
     }
 }
 

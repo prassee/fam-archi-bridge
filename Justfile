@@ -1,111 +1,236 @@
-# Justfile for managing services
+# Justfile for managing WAL Writer services
+# Aligned with docker-compose.yml services
+# ────────────────────────────────────────────────────────────────────────────
+# Quick Start Targets
+# ────────────────────────────────────────────────────────────────────────────
 
-# Start all services (core + monitoring)
-start:
-    docker-compose up -d postgres
-    @echo "Waiting for postgres to be healthy (30s timeout)..."
-    @timeout 30 bash -c 'until docker-compose ps postgres | grep -q "healthy"; do sleep 2; done' || true
-    docker-compose up -d data-pump-go postgres-exporter prometheus grafana
-    @echo "All services started!"
+# Start all services (complete stack)
+start-all:
+    docker-compose up -d
+    @echo "✓ All services started"
     @echo "Grafana: http://localhost:3000 (admin/admin)"
     @echo "Prometheus: http://localhost:9091"
-
-# Stop all services
-stop:
-    docker-compose stop data-pump-go postgres postgres-exporter prometheus grafana
-    @echo "All services stopped!"
-
-# Start core services only (postgres + data-pump-go)
-start-core:
-    docker-compose up -d postgres
-    @echo "Waiting for postgres to be healthy (30s timeout)..."
-    @timeout 30 bash -c 'until docker-compose ps postgres | grep -q "healthy"; do sleep 2; done' || true
-    docker-compose up -d data-pump-go
-    @echo "Core services started!"
-
-# Stop core services only
-stop-core:
-    docker-compose stop data-pump-go postgres
-    @echo "Core services stopped!"
-
-# Stop core services only
-stop-data-dump:
-    docker-compose stop data-pump-go
-    @echo "Data Dump Service stopped!"
-
-# Start Kafka broker
-start-kafka:
-    docker-compose up -d kafka
-    @echo "Kafka started on localhost:9092"
-
-# Stop Kafka broker
-stop-kafka:
-    docker-compose stop kafka
-    @echo "Kafka stopped!"
-
-# Start WAL Writer Rust container
-start-wal-writer:
-    docker-compose up -d wal-writer
-    @echo "WAL Writer started on http://localhost:9090"
-
-# Stop WAL Writer Rust container
-stop-wal-writer:
-    docker-compose stop wal-writer
-    @echo "WAL Writer stopped!"
-
-
-# Start monitoring services (Prometheus + Grafana + exporters)
-monitoring-start:
-    docker-compose up -d postgres-exporter kafka-exporter prometheus grafana
-    @echo "Monitoring services started!"
-    @echo "Grafana: http://localhost:3000 (admin/admin)"
-    @echo "Prometheus: http://localhost:9091"
-    @echo "Kafka Exporter: http://localhost:9308/metrics"
-
-# Stop monitoring services
-monitoring-stop:
-    docker-compose stop postgres-exporter kafka-exporter prometheus grafana
-    @echo "Monitoring services stopped!"
+    @echo "WAL Writer Rust metrics: http://localhost:9095/metrics"
+    @echo "Kafka: localhost:9092"
 
 # Stop all services
 stop-all:
     docker-compose stop
-    @echo "All services stopped!"
+    @echo "✓ All services stopped"
 
-# View logs for postgres and data-pump-go
+# Start CDC core stack only (postgres + kafka + data-pump-go + wal-writer-rust + wal-consumer)
+start-cdc:
+    docker-compose up -d postgres
+    @echo "⏳ Waiting for PostgreSQL to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; do sleep 2; done' || true
+    docker-compose up -d db-init data-pump-go kafka
+    @echo "⏳ Waiting for Kafka to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1; do sleep 2; done' || true
+    docker-compose up -d wal-writer-rust wal-consumer
+    @echo "✓ CDC stack started"
+    @echo "  PostgreSQL: localhost:5432"
+    @echo "  Kafka: localhost:9092"
+    @echo "  WAL Writer Rust metrics: http://localhost:9095/metrics"
+
+# Start CDC stack in strict ordered startup for maximum stability
+start-stable:
+    docker-compose up -d postgres
+    @echo "⏳ Waiting for PostgreSQL to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; do sleep 2; done' || true
+    docker-compose up -d kafka
+    @echo "⏳ Waiting for Kafka to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1; do sleep 2; done' || true
+    docker-compose up db-init
+    docker-compose up -d wal-writer-rust
+    @echo "⏳ Waiting for WAL Writer Rust to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T wal-writer-rust curl -s http://localhost:9095/health > /dev/null 2>&1; do sleep 2; done' || true
+    docker-compose up -d data-pump-go wal-consumer
+    @echo "✓ Stable CDC stack started"
+    @echo "  PostgreSQL: localhost:5432"
+    @echo "  Kafka: localhost:9092"
+    @echo "  WAL Writer Rust metrics: http://localhost:9095/metrics"
+
+# Stop CDC core stack
+stop-cdc:
+    docker-compose stop wal-writer-rust wal-consumer data-pump-go kafka db-init postgres
+    @echo "✓ CDC stack stopped"
+
+# Start monitoring only (prometheus + grafana + exporters)
+start-monitoring:
+    docker-compose up -d postgres-exporter kafka-exporter prometheus grafana
+    @echo "✓ Monitoring services started"
+    @echo "  Grafana: http://localhost:3000 (admin/admin)"
+    @echo "  Prometheus: http://localhost:9091"
+    @echo "  Kafka Exporter: http://localhost:9308/metrics"
+    @echo "  PostgreSQL Exporter: http://localhost:9187/metrics"
+
+# Start dashboards and exporters only
+start-dashboards:
+    docker-compose up -d prometheus grafana postgres-exporter kafka-exporter
+    @echo "✓ Dashboards and exporters started"
+    @echo "  Grafana: http://localhost:3000 (admin/admin)"
+    @echo "  Prometheus: http://localhost:9091"
+    @echo "  Kafka Exporter: http://localhost:9308/metrics"
+    @echo "  PostgreSQL Exporter: http://localhost:9187/metrics"
+    @echo "  WAL Writer Rust metrics (scraped via Prometheus)"
+
+# Stop monitoring
+stop-monitoring:
+    docker-compose stop postgres-exporter kafka-exporter prometheus grafana
+    @echo "✓ Monitoring services stopped"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Individual Service Targets
+# ────────────────────────────────────────────────────────────────────────────
+
+# PostgreSQL Database
+start-postgres:
+    docker-compose up -d postgres
+    @echo "⏳ Waiting for PostgreSQL to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; do sleep 2; done' || true
+    @echo "✓ PostgreSQL started on localhost:5432"
+
+stop-postgres:
+    docker-compose stop postgres
+    @echo "✓ PostgreSQL stopped"
+
+# Database Initialization (creates replication slot + publication)
+start-db-init:
+    docker-compose up db-init
+    @echo "✓ Database initialization completed"
+
+# Kafka Broker
+start-kafka:
+    docker-compose up -d kafka
+    @echo "⏳ Waiting for Kafka to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1; do sleep 2; done' || true
+    @echo "✓ Kafka started on localhost:9092"
+
+stop-kafka:
+    docker-compose stop kafka
+    @echo "✓ Kafka stopped"
+
+# Data Pump Go (generates UPI transactions)
+start-data-pump:
+    docker-compose up -d data-pump-go
+    @echo "✓ Data Pump started (generating ~10k txns/sec)"
+
+stop-data-pump:
+    docker-compose stop data-pump-go
+    @echo "✓ Data Pump stopped"
+
+# WAL Writer Rust (active CDC agent)
+start-wal-writer:
+    docker-compose up -d wal-writer-rust
+    @echo "⏳ Starting WAL Writer Rust..."
+    @timeout 30 bash -c 'until docker-compose exec -T wal-writer-rust curl -s http://localhost:9095/health > /dev/null 2>&1; do sleep 2; done' || true
+    @echo "✓ WAL Writer Rust started"
+    @echo "  Metrics: http://localhost:9095/metrics"
+    @echo "  Health: http://localhost:9095/health"
+
+stop-wal-writer:
+    docker-compose stop wal-writer-rust
+    @echo "✓ WAL Writer Rust stopped"
+
+# WAL Consumer (Rust consumer with parallel workers)
+start-wal-consumer:
+    docker-compose up -d wal-consumer
+    @echo "✓ WAL Consumer started"
+    @echo "  Workers: 8 (partition-based routing)"
+    @echo "  Commit threshold: 5000 messages"
+
+stop-wal-consumer:
+    docker-compose stop wal-consumer
+    @echo "✓ WAL Consumer stopped"
+
+# Prometheus (metrics collection)
+start-prometheus:
+    docker-compose up -d prometheus
+    @echo "✓ Prometheus started on http://localhost:9091"
+
+stop-prometheus:
+    docker-compose stop prometheus
+    @echo "✓ Prometheus stopped"
+
+# Grafana (metrics visualization)
+start-grafana:
+    docker-compose up -d grafana
+    @echo "✓ Grafana started on http://localhost:3000 (admin/admin)"
+
+stop-grafana:
+    docker-compose stop grafana
+    @echo "✓ Grafana stopped"
+
+# PostgreSQL Exporter (metrics from PostgreSQL)
+start-postgres-exporter:
+    docker-compose up -d postgres-exporter
+    @echo "✓ PostgreSQL Exporter started on http://localhost:9187/metrics"
+
+stop-postgres-exporter:
+    docker-compose stop postgres-exporter
+    @echo "✓ PostgreSQL Exporter stopped"
+
+# Kafka Exporter (metrics from Kafka)
+start-kafka-exporter:
+    docker-compose up -d kafka-exporter
+    @echo "✓ Kafka Exporter started on http://localhost:9308/metrics"
+
+stop-kafka-exporter:
+    docker-compose stop kafka-exporter
+    @echo "✓ Kafka Exporter stopped"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Utility Targets
+# ────────────────────────────────────────────────────────────────────────────
+
+# View live logs from all running services
 logs:
-    docker-compose logs -f postgres data-pump-go
+    docker-compose logs -f
 
-# View logs for monitoring services
-logs-monitoring:
-    docker-compose logs -f postgres-exporter kafka-exporter prometheus grafana
+# View logs from specific service (usage: just logs-service wal-writer)
+logs-service service:
+    docker-compose logs -f {{ service }}
 
-# Check status of postgres and data-pump-go
+# View status of all services
 status:
-    docker-compose ps postgres data-pump-go
+    docker-compose ps
 
-# Check status of monitoring services
-status-monitoring:
-    docker-compose ps postgres-exporter kafka-exporter prometheus grafana
-
-# Restart core services
+# Restart all services
 restart:
-    just stop
-    just start
+    @just stop-all
+    @just start-all
 
-# Restart monitoring services
-restart-monitoring:
-    just monitoring-stop
-    just monitoring-start
+# Restart CDC stack
+restart-cdc:
+    @just stop-cdc
+    @just start-cdc
 
-# Clean up (remove containers and volumes for core services)
+# Clean up all containers and volumes
 clean:
-    docker-compose rm -fsv postgres data-pump-go
-    docker volume rm rust-wal-cake-writer_postgres-data 2>/dev/null || true
-    @echo "Cleanup completed!"
+    docker-compose down -v
+    @echo "✓ All containers and volumes removed"
+    @echo "Note: This includes rust writer rollback service if present."
 
-# Clean up monitoring
-clean-monitoring:
-    docker-compose rm -fsv postgres-exporter kafka-exporter prometheus grafana
-    docker volume rm rust-wal-cake-writer_prometheus-data rust-wal-cake-writer_grafana-data 2>/dev/null || true
-    @echo "Monitoring cleanup completed!"
+# Clean up containers only (keep volumes)
+clean-containers:
+    docker-compose down
+    @echo "✓ All containers removed"
+
+# Show configuration for a service (usage: just config wal-writer)
+config service:
+    docker-compose config --services | grep {{ service }}
+    @echo "Service: {{ service }}"
+    docker-compose ps {{ service }} || echo "Service not running"
+
+# Test connectivity to key endpoints
+test:
+    @echo "Testing PostgreSQL..."
+    @docker-compose exec -T postgres pg_isready -U postgres || echo "❌ PostgreSQL not responding"
+    @echo "✓ PostgreSQL responding"
+    @echo "Testing Kafka..."
+    @docker-compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list > /dev/null || echo "❌ Kafka not responding"
+    @echo "✓ Kafka responding"
+    @echo "Testing WAL Writer Rust..."
+    @curl -s http://localhost:9095/health > /dev/null || echo "❌ WAL Writer Rust not responding"
+    @echo "✓ WAL Writer Rust responding"
+    @echo "✓ All systems operational"

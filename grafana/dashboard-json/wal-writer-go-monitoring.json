@@ -421,6 +421,13 @@
                     "legendFormat": "last_process_lsn",
                     "range": true,
                     "refId": "B"
+                },
+                {
+                    "editorMode": "code",
+                    "expr": "wal_writer_last_acked_lsn",
+                    "legendFormat": "last_acked_lsn",
+                    "range": true,
+                    "refId": "C"
                 }
             ],
             "title": "LSN Progress",
@@ -515,8 +522,8 @@
     },
     "timepicker": {},
     "timezone": "",
-    "title": "WAL Writer Go Monitoring",
-    "uid": "wal-writer-go-monitor",
+    "title": "WAL Writer Rust Monitoring",
+    "uid": "wal-writer-rust-monitor",
     "version": 1,
     "weekStart": ""
 }

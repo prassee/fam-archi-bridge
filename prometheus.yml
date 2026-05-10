@@ -18,8 +18,8 @@ scrape_configs:
       - targets: ['kafka-exporter:9308']
     scrape_interval: 5s
 
-  - job_name: 'wal-writer-go'
+  - job_name: 'wal-writer-rust'
     static_configs:
-      - targets: ['wal-writer:9090']
+      - targets: ['wal-writer-rust:9090']
     metrics_path: /metrics
     scrape_interval: 5s
