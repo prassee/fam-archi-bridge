@@ -2,10 +2,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::fs;
 use serde::{Deserialize, Serialize};
+use crate::wal_parser::WalRecord;
 
 #[derive(Clone)]
 pub struct LsnTracker {
@@ -62,6 +64,76 @@ impl LsnTracker {
     pub async fn get_last_lsn(&self, topic: &str) -> Option<String> {
         let state = self.state.read().await;
         state.get(topic).map(|s| s.last_lsn.clone())
+    }
+}
+
+/// Represents a batch of CDC records pending publish to Kafka
+/// After successful Kafka publish, all LSNs in this batch are acknowledged together
+#[derive(Clone, Debug)]
+pub struct PendingBatch {
+    pub records: Vec<WalRecord>,
+    pub lsns: Vec<u64>,
+    pub max_lsn: u64,
+    pub created_at: Instant,
+    pub topic: String,
+}
+
+/// Configuration for batch aggregation
+#[derive(Clone, Debug)]
+pub struct BatchConfig {
+    /// Max records per batch before triggering Kafka publish
+    pub max_records_per_batch: usize,
+    /// Max time to wait before flushing a partial batch (milliseconds)
+    pub flush_interval_ms: u64,
+}
+
+/// Thread-safe queue for batches awaiting Kafka publish
+/// Prevents buffering too many batches in memory
+#[derive(Clone)]
+pub struct BatchQueue {
+    pending: Arc<RwLock<VecDeque<PendingBatch>>>,
+    max_pending_batches: usize,
+}
+
+impl BatchQueue {
+    pub fn new(max_pending_batches: usize) -> Self {
+        Self {
+            pending: Arc::new(RwLock::new(VecDeque::new())),
+            max_pending_batches,
+        }
+    }
+
+    pub async fn enqueue(&self, batch: PendingBatch) -> anyhow::Result<()> {
+        let mut queue = self.pending.write().await;
+        if queue.len() >= self.max_pending_batches {
+            return Err(anyhow::anyhow!(
+                "Pending batch queue full: {} batches awaiting Kafka publish",
+                queue.len()
+            ));
+        }
+        queue.push_back(batch);
+        Ok(())
+    }
+
+    pub async fn enqueue_front(&self, batch: PendingBatch) -> anyhow::Result<()> {
+        let mut queue = self.pending.write().await;
+        if queue.len() >= self.max_pending_batches {
+            return Err(anyhow::anyhow!(
+                "Pending batch queue full: {} batches awaiting Kafka publish",
+                queue.len()
+            ));
+        }
+        queue.push_front(batch);
+        Ok(())
+    }
+
+    pub async fn dequeue(&self) -> Option<PendingBatch> {
+        let mut queue = self.pending.write().await;
+        queue.pop_front()
+    }
+
+    pub async fn count(&self) -> usize {
+        self.pending.read().await.len()
     }
 }
 

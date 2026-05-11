@@ -302,6 +302,32 @@ impl Metrics {
 
         writeln!(
             output,
+            "# HELP wal_writer_kafka_messages_sent_total Kafka messages successfully sent"
+        )
+        .ok();
+        writeln!(output, "# TYPE wal_writer_kafka_messages_sent_total counter").ok();
+        writeln!(
+            output,
+            "wal_writer_kafka_messages_sent_total {}",
+            self.0.kafka_messages_sent.load(Ordering::Relaxed)
+        )
+        .ok();
+
+        writeln!(
+            output,
+            "# HELP wal_writer_kafka_send_errors_total Kafka send error count"
+        )
+        .ok();
+        writeln!(output, "# TYPE wal_writer_kafka_send_errors_total counter").ok();
+        writeln!(
+            output,
+            "wal_writer_kafka_send_errors_total {}",
+            self.0.kafka_send_errors.load(Ordering::Relaxed)
+        )
+        .ok();
+
+        writeln!(
+            output,
             "# HELP wal_writer_publish_duration_seconds Publish duration histogram"
         )
         .ok();

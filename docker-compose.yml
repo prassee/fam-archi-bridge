@@ -209,65 +209,8 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
-    # WAL Writer service (Go implementation)
-    # Derived from k8s/deployment.yaml and k8s/configmap.yaml
-    #  wal-writer:
-    #    image: wal-writer:latest
-    #    container_name: wal-writer
-    #    hostname: wal-writer
-    #    build:
-    #      context: .
-    #      dockerfile: wal_writer_go/Dockerfile
-    #    ports:
-    #      - "9090:9090"
-    #    environment:
-    #      # Pod metadata (simulated from K8s downward API)
-    #      POD_NAME: wal-writer
-    #      POD_IP: 172.18.0.4
-    #      # PostgreSQL config (from k8s/kustomization.yaml and k8s/configmap.yaml)
-    #      WAL_WRITER_PG_HOST: postgres
-    #      WAL_WRITER_PG_PORT: 5432
-    #      WAL_WRITER_PG_USER: postgres
-    #      WAL_WRITER_PG_PASSWORD: postgres
-    #      WAL_WRITER_PG_DATABASE: postgres
-    #      WAL_WRITER_PG_SLOT_NAME: wal_writer_slot_v2
-    #      # Kafka config (from k8s/kustomization.yaml and k8s/configmap.yaml)
-    #      WAL_WRITER_KAFKA_BROKERS: kafka:9092
-    #      WAL_WRITER_KAFKA_TOPIC_PREFIX: cdc
-    #      WAL_WRITER_KAFKA_ACKS: all
-    #      WAL_WRITER_KAFKA_LINGER_MS: 5
-    #      WAL_WRITER_KAFKA_BATCH_SIZE: 16384
-    #      # Replication config (from k8s/configmap.yaml)
-    #      WAL_WRITER_PUBLICATION: wal_writer_publication
-    #      WAL_WRITER_REPLICATION_BATCH_SIZE: 100
-    #      WAL_WRITER_REPLICATION_POLL_INTERVAL_MS: 10
-    #      # Logging config (from k8s/configmap.yaml)
-    #      WAL_WRITER_LOGGING_LEVEL: info
-    #      WAL_WRITER_LOGGING_DIRECTORY: /var/log/wal-writer
-    #      # Note: K8s uses ConfigMap and Secret for these values
-    #      # ConfigMap: wal-writer-config (k8s/configmap.yaml + k8s/kustomization.yaml)
-    #      # Secret: wal-writer-secret (k8s/configmap.yaml)
-    #    volumes:
-    #      - logs-data:/var/log/wal-writer
-    #    depends_on:
-    #      postgres:
-    #        condition: service_healthy
-    #      kafka:
-    #        condition: service_healthy
-    #      db-init:
-    #        condition: service_completed_successfully
-    #    healthcheck:
-    #      test: [ "CMD", "curl", "-f", "http://localhost:9090/health" ]
-    #      interval: 10s
-    #      timeout: 5s
-    #      retries: 3
-    #      start_period: 30s
-    #    restart: unless-stopped
-    #    # Resource hints (K8s requests: 500m CPU, 512Mi memory; limits: 2000m CPU, 2Gi memory)
-    #    # Note: K8s deployment has 2 replicas with pod anti-affinity
-    #    # For local testing, use 1 replica; scale with: docker-compose up --scale wal-writer=2
 
-    # Rust WAL Writer service (active CDC agent)
+  # Rust WAL Writer service (active CDC agent)
   wal-writer-rust:
     image: wal-writer-rust:latest
     container_name: wal-writer-rust
@@ -290,11 +233,11 @@ services:
       WAL_WRITER_KAFKA_LINGER_MS: 5
       WAL_WRITER_KAFKA_BATCH_SIZE: 16384
       WAL_WRITER_PUBLICATION: wal_writer_publication
-      WAL_WRITER_REPLICATION_BATCH_SIZE: 100
+      WAL_WRITER_REPLICATION_BATCH_SIZE: 500
       WAL_WRITER_REPLICATION_POLL_INTERVAL_MS: 10
       WAL_WRITER_LOGGING_LEVEL: info
       WAL_WRITER_LOGGING_DIRECTORY: /var/log/wal-writer
-      WAL_WRITER_DEBUG_NO_KAFKA: "true"
+      WAL_WRITER_DEBUG_NO_KAFKA: "false"
       WAL_WRITER_DEBUG_PRINT_WAL: "true"
     volumes:
       - logs-data:/var/log/wal-writer

@@ -14,6 +14,18 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn from_env() -> Result<Self, env::VarError> {
         let state_dir = env::var("WAL_WRITER_STATE_DIR").ok().map(PathBuf::from);
+        let replication_batch_size = env::var("WAL_WRITER_REPLICATION_BATCH_SIZE")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse()
+            .unwrap_or(100);
+        let replication_poll_interval_ms = env::var("WAL_WRITER_REPLICATION_POLL_INTERVAL_MS")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse()
+            .unwrap_or(10);
+        let logging_directory = env::var("WAL_WRITER_LOGGING_DIRECTORY")
+            .unwrap_or_else(|_| "/var/log/wal-writer".to_string());
+        let logging_level =
+            env::var("WAL_WRITER_LOGGING_LEVEL").unwrap_or_else(|_| "info".to_string());
 
         Ok(Self {
             pg: PostgresConfig {
@@ -42,6 +54,10 @@ impl AppConfig {
                     .unwrap_or_else(|_| "16384".to_string())
                     .parse()
                     .unwrap_or(16384),
+                queue_buffering_max_ms: env::var("WAL_WRITER_KAFKA_QUEUE_BUFFERING_MAX_MS")
+                    .unwrap_or_else(|_| "50".to_string())
+                    .parse()
+                    .unwrap_or(50),
                 compression: env::var("WAL_WRITER_KAFKA_COMPRESSION").ok(),
                 debug_no_kafka: env::var("WAL_WRITER_DEBUG_NO_KAFKA")
                     .map(|v| v.eq_ignore_ascii_case("true"))
@@ -49,13 +65,21 @@ impl AppConfig {
                 debug_print_wal: env::var("WAL_WRITER_DEBUG_PRINT_WAL")
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false),
+                publish_raw_wal: env::var("WAL_WRITER_PUBLISH_RAW_WAL")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             },
             replication: ReplicationConfig {
                 publication: env::var("WAL_WRITER_PUBLICATION")
                     .unwrap_or_else(|_| "wal_writer_publication".to_string()),
-                ..Default::default()
+                wal_position: None,
+                batch_size: replication_batch_size,
+                poll_interval_ms: replication_poll_interval_ms,
             },
-            logging: LoggingConfig::default(),
+            logging: LoggingConfig {
+                directory: logging_directory,
+                level: logging_level,
+            },
             state: StateConfig {
                 directory: state_dir,
                 persist_interval_secs: env::var("WAL_WRITER_STATE_PERSIST_INTERVAL_SECS")
@@ -97,9 +121,11 @@ pub struct KafkaConfig {
     pub acks: String,
     pub linger_ms: u32,
     pub batch_size: u32,
+    pub queue_buffering_max_ms: u32,
     pub compression: Option<String>,
     pub debug_no_kafka: bool,
     pub debug_print_wal: bool,
+    pub publish_raw_wal: bool,
 }
 
 impl KafkaConfig {

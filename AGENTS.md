@@ -288,6 +288,9 @@ The following issues were identified in the full codebase review (May 2026). Ord
 | 20 | `docker-compose.yml` | **High** | ✅ Fixed: `db-init` command never exited (looping `until` replaced with `while` + `exit 0`) — caused `docker compose up wal-writer` to hang indefinitely waiting for `service_completed_successfully` |
 | 21 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: `confirmed_flush_lsn` stayed NULL — `nextStatus = time.Time{}` after each XLogData message sent `WALFlushPosition=0` before publisher confirmed anything; removed forced flush, reduced standby heartbeat to 2 s |
 | 22 | `wal_writer_go/main.go` | **Critical** | ✅ Fixed: publisher throughput capped at ~44 msg/s — single `WriteMessages` call per record was bounded by `BatchTimeout=5ms`; replaced with batched drain loop (up to 500 records per `WriteMessages` call); verified **~9,700 msg/s** matching data-pump input rate |
+| 23 | `wal_common/src/lib.rs` | **Critical** | ✅ Fixed: runtime env parsing gap — `WAL_WRITER_REPLICATION_BATCH_SIZE`, `WAL_WRITER_REPLICATION_POLL_INTERVAL_MS`, `WAL_WRITER_LOGGING_LEVEL`, and `WAL_WRITER_LOGGING_DIRECTORY` are now parsed from env and applied at startup |
+| 24 | `wal_writer/src/pg_replication.rs` | **Critical** | ✅ Fixed: persisted slot LSN was loaded but ignored (`start_lsn` hardcoded to `0/0`) — replication now resumes from persisted LSN when present |
+| 25 | `wal_writer/src/pg_replication.rs` | **Critical** | ✅ Fixed: pending batch queue overflow previously logged and continued (silent drop risk) — now fail-stop on enqueue overflow to prevent data loss with slot advancement |
 
 ## Code Review Details
 
@@ -558,6 +561,39 @@ If you want I can implement these steps in order. Stopping now as requested.
 - Fixed Kafka `BatchSize` not wired — now reads from `WAL_WRITER_KAFKA_BATCH_SIZE` env var.
 - Fixed password credential leak in log output — `redactPassword()` helper sanitizes pgconn connection error messages before logging.
 - Fixed wal_consumer offset commit counters resetting on failure — counters now accumulate across failures so retry fires sooner.
+- Fixed critical runtime config gap in `wal_common/src/lib.rs` so replication and logging env vars are no longer ignored at runtime.
+- Fixed critical resume bug in `wal_writer/src/pg_replication.rs` by starting replication from persisted slot LSN instead of always from `0/0`.
+- Fixed critical data-loss mode in `wal_writer/src/pg_replication.rs` by failing fast on pending batch queue overflow instead of logging and continuing.
+
+## Kafka Batching (Current Rust Implementation)
+
+The active runtime path in this repository is the Rust writer (`wal_writer/`) running as `wal-writer-rust` in Docker Compose.
+
+Current batching flow:
+
+1. **Stage 1: Parse + table grouping**
+    - `WalParser` decodes WAL bytes into `WalRecord` values.
+    - The replication loop groups records by `(schema, table)` and maps each group to topic `{topic_prefix}.{schema}.{table}`.
+
+2. **Stage 1.5: Split into pending batches**
+    - Each per-table record slice is split by `max_records_per_batch` into `PendingBatch` entries.
+    - Batches are pushed to a bounded `BatchQueue` (max 1000 pending batches).
+
+3. **Stage 2: Publisher micro-batching + Kafka publish**
+    - A dedicated `batch_publisher_loop` task dequeues pending batches.
+    - It coalesces contiguous same-topic batches up to configured record cap or flush interval.
+    - Publish path calls `publish_batch()` and sends one Kafka message per `WalRecord` with retry on `QueueFull`.
+
+4. **Stage 3: ACK only after publish success**
+    - On publish success, `max_lsn` from the published batch is sent over ack channel.
+    - Replication loop applies LSN via `update_applied_lsn()` and updates `last_acked_lsn` metric.
+    - LSN is also persisted to local state for restart resume.
+
+Current behavior guarantees:
+
+- ACK position only advances after Kafka publish success.
+- Restart resumes from persisted slot LSN when available.
+- Queue overflow now fails fast to avoid silent message loss while advancing slot position.
 - Fixed wal_consumer graceful shutdown — `tokio::signal::ctrl_c()` handler now performs a final synchronous commit before process exit.
 - Fixed wal_consumer unnecessary UTF-8 payload decode — replaced with zero-copy `message.payload().map_or(0, |p| p.len())`.
 - Fixed `db-init` command never terminating — replaced `until` loop (bash-only) with POSIX `while` loop and added explicit `exit 0`; `docker compose up wal-writer` now correctly waits for `service_completed_successfully`.

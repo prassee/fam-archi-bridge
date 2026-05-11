@@ -132,6 +132,18 @@ stop-wal-writer:
     docker-compose stop wal-writer-rust
     @echo "✓ WAL Writer Rust stopped"
 
+# Recompile, rebuild image, and redeploy WAL Writer Rust
+redeploy-wal-writer:
+    @echo "⏳ Recompiling and rebuilding WAL Writer Rust image..."
+    docker-compose build --no-cache wal-writer-rust
+    @echo "⏳ Re-deploying WAL Writer Rust container..."
+    docker-compose up -d --force-recreate wal-writer-rust
+    @echo "⏳ Waiting for WAL Writer Rust to be healthy..."
+    @timeout 60 bash -c 'until docker-compose exec -T wal-writer-rust curl -s http://localhost:9095/health > /dev/null 2>&1; do sleep 2; done' || true
+    @echo "✓ WAL Writer Rust recompiled, rebuilt, and redeployed"
+    @echo "  Metrics: http://localhost:9095/metrics"
+    @echo "  Health: http://localhost:9095/health"
+
 # WAL Consumer (Rust consumer with parallel workers)
 start-wal-consumer:
     docker-compose up -d wal-consumer

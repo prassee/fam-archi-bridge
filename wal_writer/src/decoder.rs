@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use tokio::time;
 use tracing::{debug, error, warn};
 
 use crate::kafka::KafkaProducer;
@@ -20,6 +20,10 @@ impl WalDecoder {
             kafka: kafka_producer,
             metrics,
         }
+    }
+
+    pub fn kafka_topic_prefix(&self) -> &str {
+        self.kafka.topic_prefix()
     }
 
     pub async fn send_batch(&self, records: &[WalRecord]) -> Result<Option<u64>> {
@@ -62,7 +66,7 @@ impl WalDecoder {
                 let mut backoff_ms = 10u64;
 
                 loop {
-                    match self.kafka.send(&topic, &key, &value) {
+                    match self.kafka.send(&topic, &key, &value).await {
                         Ok(()) => {
                             self.metrics.kafka_messages_sent_inc();
                             self.metrics.published_record_inc(record.operation.clone());
@@ -80,7 +84,7 @@ impl WalDecoder {
                                     retry_count + 1,
                                     max_retries
                                 );
-                                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                                time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                                 backoff_ms = (backoff_ms * 2).min(500); // Cap backoff at 500ms
                                 retry_count += 1;
                             } else {
@@ -104,14 +108,111 @@ impl WalDecoder {
 
         self.metrics.observe_publish_duration(batch_start.elapsed());
 
-        if let Err(err) = self.kafka.flush(Duration::from_secs(5)) {
-            error!("Kafka flush failed: {}", err);
-            self.metrics.publish_failure_inc();
-            self.metrics.process_wal_errors_inc();
-            return Err(anyhow!("Kafka flush failed: {}", err));
+        Ok(Some(highest_lsn))
+    }
+
+    /// Stage 2: Publish batch to Kafka with retry logic
+    /// Only call this after buffer_records() has prepared the batch
+    /// This is separated from buffering to enable LSN ack AFTER Kafka confirms
+    pub async fn publish_batch(&self, topic: &str, records: &[WalRecord]) -> Result<u64> {
+        if records.is_empty() {
+            return Ok(0);
         }
 
-        Ok(Some(highest_lsn))
+        debug!(
+            "Publishing batch to Kafka topic='{}' records={}",
+            topic,
+            records.len()
+        );
+
+        let mut retry_count = 0;
+        const MAX_RETRIES: usize = 5;
+        let mut backoff_ms = 10u64;
+        let publish_start = std::time::Instant::now();
+
+        loop {
+            match self.send_batch_to_kafka(topic, records).await {
+                Ok(()) => {
+                    let highest_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
+                    self.metrics.set_last_process_lsn(highest_lsn);
+                    self.metrics.observe_publish_duration(publish_start.elapsed());
+                    return Ok(highest_lsn);
+                }
+                Err(e) => {
+                    if retry_count < MAX_RETRIES && e.to_string().contains("QueueFull") {
+                        warn!(
+                            "Kafka queue full for topic='{}', retrying in {}ms (attempt {}/{})",
+                            topic,
+                            backoff_ms,
+                            retry_count + 1,
+                            MAX_RETRIES
+                        );
+                        time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(500);
+                        retry_count += 1;
+                    } else {
+                        error!(
+                            "Kafka publish failed after {} retries for topic='{}': {}",
+                            retry_count, topic, e
+                        );
+                        self.metrics.kafka_send_errors_inc();
+                        self.metrics.publish_failure_inc();
+                        self.metrics.process_wal_errors_inc();
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper: Send all records in batch to Kafka (one message per record)
+    async fn send_batch_to_kafka(
+        &self,
+        topic: &str,
+        records: &[WalRecord],
+    ) -> Result<(), rdkafka::error::KafkaError> {
+        if self.kafka.is_debug_no_kafka() {
+            return Ok(());
+        }
+
+        for record in records {
+            let key = record.tx_xid.to_string();
+            let value = serde_json::to_string(&record)
+                .map_err(|e| rdkafka::error::KafkaError::ClientCreation(e.to_string()))?;
+            self.kafka.send(topic, &key, &value).await?;
+            self.metrics.kafka_messages_sent_inc();
+            self.metrics.published_record_inc(record.operation.clone());
+        }
+        Ok(())
+    }
+
+    pub async fn send_raw(&self, topic: &str, key: &str, value: &str) -> Result<()> {
+        debug!("Ensuring Kafka topic '{}' exists", topic);
+        if let Err(e) = self.kafka.ensure_topic(topic) {
+            warn!("Failed to ensure topic '{}': {}", topic, e);
+            self.metrics.process_wal_errors_inc();
+            return Err(e.into());
+        }
+
+        let send_start = std::time::Instant::now();
+        match self.kafka.send(topic, key, value).await {
+            Ok(()) => {
+                self.metrics.kafka_messages_sent_inc();
+                self.metrics.observe_publish_duration(send_start.elapsed());
+            }
+            Err(e) => {
+                error!(
+                    "Kafka raw send failed topic='{}' key='{}': {}",
+                    topic, key, e
+                );
+                self.metrics.kafka_send_errors_inc();
+                self.metrics.publish_failure_inc();
+                self.metrics.process_wal_errors_inc();
+                return Err(anyhow!("Kafka send failed: {}", e));
+            }
+        }
+
+        Ok(())
     }
 }
 

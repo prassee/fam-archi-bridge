@@ -280,6 +280,58 @@
                     "color": {
                         "mode": "palette-classic"
                     },
+                    "unit": "short"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 6,
+                "w": 12,
+                "x": 0,
+                "y": 18
+            },
+            "id": 9,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "targets": [
+                {
+                    "editorMode": "code",
+                    "expr": "wal_writer_kafka_send_errors_total",
+                    "legendFormat": "send_errors",
+                    "range": true,
+                    "refId": "A"
+                },
+                {
+                    "editorMode": "code",
+                    "expr": "wal_writer_kafka_messages_sent_total",
+                    "legendFormat": "messages_sent",
+                    "range": true,
+                    "refId": "B"
+                }
+            ],
+            "title": "Kafka Send Errors + Messages Sent",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
                     "unit": "s"
                 },
                 "overrides": []
@@ -431,6 +483,51 @@
                 }
             ],
             "title": "LSN Progress",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "unit": "short"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 6,
+                "w": 12,
+                "x": 12,
+                "y": 18
+            },
+            "id": 10,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "targets": [
+                {
+                    "editorMode": "code",
+                    "expr": "wal_writer_last_receive_lsn - wal_writer_last_acked_lsn",
+                    "legendFormat": "lsn_ack_gap",
+                    "range": true,
+                    "refId": "A"
+                }
+            ],
+            "title": "LSN Ack Gap",
             "type": "timeseries"
         },
         {
