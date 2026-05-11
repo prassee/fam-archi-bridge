@@ -19,10 +19,10 @@ High-throughput UPI transaction data generator for PostgreSQL, written in Go. Po
 | `DB_USER` | `postgres` | PostgreSQL user |
 | `DB_PASSWORD` | `postgres` | PostgreSQL password |
 | `DB_NAME` | `postgres` | Database name |
-| `DATA_PUMP_TARGET_PER_SEC` | `2000` | Target UPI transactions per second |
-| `DATA_PUMP_BATCH_SIZE` | `500` | Number of records per UPI insert batch |
-| `DATA_PUMP_USERS_BATCH_SIZE` | `500` | Number of user records per batch |
-| `DATA_PUMP_NUM_WORKERS` | `10` | Number of concurrent batch insert workers |
+| `DATA_PUMP_TARGET_PER_SEC` | `20000` | Target UPI transactions per second |
+| `DATA_PUMP_BATCH_SIZE` | `1000` | Number of records per UPI insert batch |
+| `DATA_PUMP_USERS_BATCH_SIZE` | `100` | Number of user records per batch |
+| `DATA_PUMP_NUM_WORKERS` | `20` | Number of concurrent batch insert workers |
 
 ## Build
 

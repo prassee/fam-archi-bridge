@@ -39,9 +39,9 @@ Go Data Pump ──(insert & update)──► PgSQL
 ```
 
 ### Phase 2 — CDC Capture & Streaming ✅ Complete
-The **WAL Cake Agent** (Go implementation) connects to PostgreSQL via logical replication, consumes the Write-Ahead Log, decodes change events (Insert/Update/Delete/Truncate), and pushes them as structured CDC messages to **Kafka Topics**. Metrics are exported to **Grafana** for observability.
+The **WAL Cake Agent** (Rust implementation) connects to PostgreSQL via logical replication, consumes the Write-Ahead Log, decodes change events (Insert/Update/Delete/Truncate), and pushes them as structured CDC messages to **Kafka Topics**. Metrics are exported to **Grafana** for observability.
 
-Deployed services: `wal-writer` (Go CDC agent, metrics on `:9090`), `kafka` (Confluent CP-Kafka 7.5, auto topic creation enabled on port `9092`).
+Deployed services: `wal-writer-rust` (Rust CDC agent, metrics exposed at container port `:9090` and host port `:9095`), `kafka` (Confluent CP-Kafka 7.5, auto topic creation enabled on port `9092`).
 
 Verified: the replication loop now parses pgoutput messages end-to-end, acknowledges consumed LSNs back to PostgreSQL, persists commit progress, and publishes CDC events to Kafka topics. Observability is in place through Prometheus, PostgreSQL Exporter, Kafka Exporter, and Grafana dashboards.
 
@@ -86,14 +86,17 @@ rust-wal-cake-writer/
 │   ├── go.sum
 │   ├── Dockerfile
 │   └── README.md
-├── wal_writer_go/            # Main Go WAL writer project
+├── wal_common/               # Shared runtime config/types
+│   ├── Cargo.toml
+│   └── src/lib.rs
+├── wal_consumer/             # Rust Kafka consumer (Phase 3 base)
+│   ├── Cargo.toml
 │   ├── Dockerfile
-│   ├── go.mod
-│   └── main.go
-└── wal_writer/               # Deprecated Rust WAL writer (legacy fallback)
+│   └── src/main.rs
+└── wal_writer/               # Active Rust WAL writer
    ├── Cargo.toml
    ├── Cargo.lock
-   ├── Dockerfile            # Deprecated image, retained for rollback only
+    ├── Dockerfile
    ├── src/
    │   ├── main.rs
    │   ├── lib.rs
@@ -112,7 +115,7 @@ rust-wal-cake-writer/
 ## Build
 
 ```bash
-docker compose build wal-writer
+docker compose build wal-writer-rust
 ```
 
 ## Environment Variables
@@ -152,7 +155,7 @@ Each table maps to `{topic_prefix}.{schema}.{table}` (e.g., `cdc.public.users`).
 ## Run
 
 ```bash
-docker compose up -d wal-writer
+docker compose up -d wal-writer-rust
 ```
 
 ## Kubernetes
@@ -200,8 +203,8 @@ All Phase 1 and Phase 2 services plus the full monitoring stack are available vi
 | `kafka` | confluentinc/cp-kafka:7.5.0 | 9092 | CDC event broker |
 | `data-pump-go` | data-pump-go:latest | — | UPI transaction load generator |
 | `db-init` | postgres:16-alpine | — | One-shot: creates replication slot + publication |
-| `wal-writer` | wal-writer:latest | 9090 | Go CDC agent (metrics on `/health`, `/ready`) |
-| `wal-writer-rust` | wal-writer-rust:latest | 9095 | Deprecated Rust fallback (disabled by default) |
+| `wal-writer-rust` | wal-writer-rust:latest | 9095 | Active Rust CDC agent (health + metrics) |
+| `wal-consumer` | wal-consumer:latest | — | Rust Kafka consumer for downstream processing |
 | `postgres-exporter` | prometheuscommunity/postgres-exporter | 9187 | PostgreSQL metrics exporter |
 | `kafka-exporter` | danielqsj/kafka-exporter:latest | 9308 | Kafka broker and topic metrics exporter |
 | `prometheus` | prom/prometheus | 9091 | Metrics collection |
@@ -253,12 +256,10 @@ wal-writer (:9090/metrics) ───────────┘
 
 ## Notes
 
-- WAL Writer default runtime is now Go (`wal_writer_go/`)
-- Rust WAL Writer (`wal_writer/`) is deprecated and kept only for rollback safety
-- Kafka topic naming remains `{topic_prefix}.{schema}.{table}`
-- Metrics endpoint remains on `:9090` with `/health` and `/ready`
+- Active WAL Writer runtime is Rust (`wal_writer/`) via service `wal-writer-rust`.
+- Kafka topic naming remains `{topic_prefix}.{schema}.{table}`.
+- Metrics endpoint is exposed at container `:9090` and host `:9095` with `/health` and `/metrics`.
 - Debug session: isolate `wal-writer-rust` and `data-pump-go`, stop Kafka and monitoring services, and use `WAL_WRITER_DEBUG_NO_KAFKA=true` + `WAL_WRITER_DEBUG_PRINT_WAL=true` to print parsed WAL records without sending to Kafka.
-- Use Docker Compose profile `deprecated-rust` only when validating legacy fallback
 
 ## Known Issues
 
