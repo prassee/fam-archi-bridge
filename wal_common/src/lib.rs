@@ -15,13 +15,13 @@ impl AppConfig {
     pub fn from_env() -> Result<Self, env::VarError> {
         let state_dir = env::var("WAL_WRITER_STATE_DIR").ok().map(PathBuf::from);
         let replication_batch_size = env::var("WAL_WRITER_REPLICATION_BATCH_SIZE")
-            .unwrap_or_else(|_| "100".to_string())
+            .unwrap_or_else(|_| "2000".to_string())
             .parse()
-            .unwrap_or(100);
+            .unwrap_or(2000);
         let replication_poll_interval_ms = env::var("WAL_WRITER_REPLICATION_POLL_INTERVAL_MS")
-            .unwrap_or_else(|_| "10".to_string())
+            .unwrap_or_else(|_| "50".to_string())
             .parse()
-            .unwrap_or(10);
+            .unwrap_or(50);
         let logging_directory = env::var("WAL_WRITER_LOGGING_DIRECTORY")
             .unwrap_or_else(|_| "/var/log/wal-writer".to_string());
         let logging_level =
