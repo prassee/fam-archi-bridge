@@ -31,6 +31,14 @@ spec:
               key: WAL_WRITER_PG_PASSWORD
         - name: DB_NAME
           value: postgres
+        - name: DATA_PUMP_TARGET_PER_SEC
+          value: "5000"
+        - name: DATA_PUMP_BATCH_SIZE
+          value: "500"
+        - name: DATA_PUMP_USERS_BATCH_SIZE
+          value: "100"
+        - name: DATA_PUMP_NUM_WORKERS
+          value: "20"
         resources:
           requests:
             cpu: 100m

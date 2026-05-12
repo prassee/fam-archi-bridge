@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: cdc
+  labels:
+    app: db-init
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: db-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: db-init
+        image: postgres:16-alpine
+        env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wal-writer-secret
+              key: WAL_WRITER_PG_PASSWORD
+        - name: PGUSER
+          value: postgres
+        - name: PGDATABASE
+          value: postgres
+        - name: PGHOST
+          value: postgres.cdc.svc.cluster.local
+        - name: PGPORT
+          value: "5432"
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Waiting for PostgreSQL to be ready..."
+            until pg_isready -h postgres.cdc.svc.cluster.local -p 5432 -U postgres; do
+              sleep 2
+            done
+            echo "PostgreSQL is ready. Creating replication slot and publication if not exists..."
+            psql -h postgres.cdc.svc.cluster.local -p 5432 -U postgres -d postgres <<-EOSQL
+              SELECT pg_create_logical_replication_slot('wal_writer_slot_v2', 'pgoutput', false, false)
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot_v2'
+                );
+              SELECT slot_name, plugin, slot_type, active
+                FROM pg_replication_slots WHERE slot_name = 'wal_writer_slot_v2';
+            EOSQL
+            psql -h postgres.cdc.svc.cluster.local -p 5432 -U postgres -d postgres \
+              -c "CREATE PUBLICATION wal_writer_publication FOR ALL TABLES" 2>/dev/null \
+              || echo "Publication already exists"
+            psql -h postgres.cdc.svc.cluster.local -p 5432 -U postgres -d postgres \
+              -c "SELECT pubname, puballtables FROM pg_publication WHERE pubname = 'wal_writer_publication';"
+            echo "Replication slot and publication check/creation completed."
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi

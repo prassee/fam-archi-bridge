@@ -234,6 +234,93 @@ config service:
     @echo "Service: {{ service }}"
     docker-compose ps {{ service }} || echo "Service not running"
 
+# ────────────────────────────────────────────────────────────────────────────
+# Kubernetes Targets
+# ────────────────────────────────────────────────────────────────────────────
+
+# Deploy full stack to Kubernetes via Kustomize
+k8s-deploy:
+    kubectl apply -k k8s/
+    @echo "✓ Full stack deployed to Kubernetes (namespace: cdc)"
+
+# Tear down all Kubernetes resources (namespace included)
+k8s-destroy:
+    kubectl delete -k k8s/ --ignore-not-found
+    @echo "✓ Kubernetes resources removed"
+
+# Show status of all pods in cdc namespace
+k8s-status:
+    kubectl get pods,svc,pvc -n cdc
+
+# Deploy infrastructure only (postgres + kafka + db-init)
+k8s-deploy-infra:
+    kubectl apply -f k8s/namespace.yaml
+    kubectl apply -f k8s/rbac.yaml
+    kubectl apply -f k8s/configmap.yaml
+    kubectl apply -f k8s/postgres.yaml
+    kubectl apply -f k8s/kafka.yaml
+    kubectl apply -f k8s/db-init.yaml
+    @echo "✓ Infra deployed (postgres, kafka, db-init)"
+
+# Deploy WAL Writer only
+k8s-deploy-wal-writer:
+    kubectl apply -f k8s/deployment.yaml
+    @echo "✓ WAL Writer deployed"
+    kubectl rollout status deployment/wal-writer -n cdc
+
+# Deploy data pump only
+k8s-deploy-data-pump:
+    kubectl apply -f k8s/data-pump-go.yaml
+    @echo "✓ Data Pump deployed"
+
+# Restart WAL Writer deployment (picks up new image)
+k8s-restart-wal-writer:
+    kubectl rollout restart deployment/wal-writer -n cdc
+    kubectl rollout status deployment/wal-writer -n cdc
+    @echo "✓ WAL Writer restarted"
+
+# View live logs from WAL Writer pods
+k8s-logs-wal-writer:
+    kubectl logs -n cdc -l app=wal-writer -f --tail=100
+
+# View live logs from data-pump pods
+k8s-logs-data-pump:
+    kubectl logs -n cdc -l app=data-pump-go -f --tail=100
+
+# Run db-init Job again (re-apply manifest; delete existing job first if needed)
+k8s-run-db-init:
+    kubectl delete job db-init -n cdc --ignore-not-found
+    kubectl apply -f k8s/db-init.yaml
+    kubectl wait --for=condition=complete job/db-init -n cdc --timeout=120s
+    @echo "✓ db-init job completed"
+
+# Deploy monitoring stack (prometheus + grafana + exporters)
+k8s-deploy-monitoring:
+    kubectl apply -f k8s/monitoring.yaml
+    @echo "✓ Monitoring stack deployed (prometheus, grafana, postgres-exporter, kafka-exporter)"
+
+# Port-forward Prometheus to localhost:9091 and open in browser
+k8s-open-prometheus:
+    @echo "Port-forwarding Prometheus → http://localhost:9091"
+    @kubectl port-forward -n cdc svc/prometheus 9091:9090 &
+    @sleep 2 && open http://localhost:9091 || xdg-open http://localhost:9091
+
+# Port-forward Grafana to localhost:3000 and open in browser (admin/admin)
+k8s-open-grafana:
+    @echo "Port-forwarding Grafana → http://localhost:3000 (admin/admin)"
+    @kubectl port-forward -n cdc svc/grafana 3000:3000 &
+    @sleep 2 && open http://localhost:3000 || xdg-open http://localhost:3000
+
+# Stop all active port-forwards (prometheus + grafana)
+k8s-stop-portforwards:
+    @pkill -f 'kubectl port-forward.*prometheus' || true
+    @pkill -f 'kubectl port-forward.*grafana' || true
+    @echo "✓ Port-forwards stopped"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Utility Targets
+# ────────────────────────────────────────────────────────────────────────────
+
 # Test connectivity to key endpoints
 test:
     @echo "Testing PostgreSQL..."

@@ -7,8 +7,10 @@ resources:
   - configmap.yaml
   - postgres.yaml
   - kafka.yaml
+  - db-init.yaml
   - deployment.yaml
   - data-pump-go.yaml
+  - monitoring.yaml
 
 labels:
   - pairs:
@@ -21,12 +23,13 @@ configMapGenerator:
       - WAL_WRITER_PG_PORT=5432
       - WAL_WRITER_PG_USER=postgres
       - WAL_WRITER_PG_DATABASE=postgres
-      - WAL_WRITER_PG_SLOT_NAME=wal_writer_slot
+      - WAL_WRITER_PG_SLOT_NAME=wal_writer_slot_v2
       - WAL_WRITER_KAFKA_BROKERS=kafka.cdc.svc.cluster.local:9092
       - WAL_WRITER_KAFKA_TOPIC_PREFIX=cdc
+      - WAL_WRITER_PUBLICATION=wal_writer_publication
 
 images:
-  - name: wal-writer
+  - name: wal-writer-rust
     newTag: latest
 
 patches:

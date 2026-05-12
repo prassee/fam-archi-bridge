@@ -29,20 +29,9 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: wal-writer
-        image: wal-writer:latest
+        image: wal-writer-rust:latest
         imagePullPolicy: IfNotPresent
-        args:
-        - --pod-name=$(POD_NAME)
-        - --pod-ip=$(POD_IP)
         env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
         - name: WAL_WRITER_PG_HOST
           valueFrom:
             configMapKeyRef:
@@ -72,6 +61,12 @@ spec:
               name: wal-writer-config
               key: WAL_WRITER_PG_DATABASE
               optional: true
+        - name: WAL_WRITER_PG_SLOT_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PG_SLOT_NAME
+              optional: true
         - name: WAL_WRITER_KAFKA_BROKERS
           valueFrom:
             configMapKeyRef:
@@ -98,6 +93,11 @@ spec:
             configMapKeyRef:
               name: wal-writer-config
               key: WAL_WRITER_KAFKA_BATCH_SIZE
+        - name: WAL_WRITER_PUBLICATION
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PUBLICATION
         - name: WAL_WRITER_REPLICATION_BATCH_SIZE
           valueFrom:
             configMapKeyRef:
@@ -108,11 +108,31 @@ spec:
             configMapKeyRef:
               name: wal-writer-config
               key: WAL_WRITER_REPLICATION_POLL_INTERVAL_MS
+        - name: WAL_WRITER_PENDING_BATCH_QUEUE_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_PENDING_BATCH_QUEUE_SIZE
         - name: WAL_WRITER_LOGGING_LEVEL
           valueFrom:
             configMapKeyRef:
               name: wal-writer-config
               key: WAL_WRITER_LOGGING_LEVEL
+        - name: WAL_WRITER_LOGGING_DIRECTORY
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_LOGGING_DIRECTORY
+        - name: WAL_WRITER_DEBUG_NO_KAFKA
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_DEBUG_NO_KAFKA
+        - name: WAL_WRITER_DEBUG_PRINT_WAL
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_DEBUG_PRINT_WAL
         ports:
         - containerPort: 9090
           name: metrics

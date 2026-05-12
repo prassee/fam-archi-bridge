@@ -49,6 +49,10 @@ spec:
         - "max_replication_slots=10"
         - "-c"
         - "max_wal_senders=10"
+        - "-c"
+        - "max_wal_size=5GB"
+        - "-c"
+        - "max_slot_wal_keep_size=5120"
         resources:
           requests:
             cpu: 500m
