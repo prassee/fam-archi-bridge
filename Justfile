@@ -329,6 +329,13 @@ k8s-deploy-polaris:
     kubectl apply -f k8s/polaris.yaml
     @echo "Polaris REST catalog deployed"
 
+# Re-run polaris-init catalog bootstrap job
+k8s-run-polaris-init:
+    kubectl delete job polaris-init -n cdc --ignore-not-found
+    kubectl apply -f k8s/polaris.yaml
+    kubectl wait --for=condition=complete job/polaris-init -n cdc --timeout=180s
+    @echo "polaris-init job completed"
+
 # Port-forward MinIO console to localhost:9001 and open in browser (minioadmin/minioadmin)
 k8s-open-minio:
     @echo "Port-forwarding MinIO console -> http://localhost:9001 (minioadmin/minioadmin)"

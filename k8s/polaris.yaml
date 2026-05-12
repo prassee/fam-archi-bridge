@@ -16,6 +16,8 @@ data:
     quarkus.log.file.enabled=false
     quarkus.otel.sdk.disabled=true
     polaris.readiness.ignore-severe-issues=true
+    polaris.persistence.type=relational-jdbc
+    polaris.persistence.auto-bootstrap-types=relational-jdbc
     polaris.features."DROP_WITH_PURGE_ENABLED"=true
     polaris.features."ALLOW_INSECURE_STORAGE_TYPES"=true
     polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES"=["FILE","S3","GCS","AZURE"]
@@ -41,6 +43,9 @@ stringData:
   POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: minioadmin
+  QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://postgres.cdc.svc.cluster.local:5432/postgres"
+  QUARKUS_DATASOURCE_USERNAME: "postgres"
+  QUARKUS_DATASOURCE_PASSWORD: "postgres"
 
 ---
 # ─────────────────────────────────────────────────────────────
@@ -95,6 +100,25 @@ spec:
             secretKeyRef:
               name: polaris-credentials
               key: POLARIS_BOOTSTRAP_CREDENTIALS
+        - name: POLARIS_PERSISTENCE_TYPE
+          value: relational-jdbc
+        - name: POLARIS_PERSISTENCE_AUTO_BOOTSTRAP_TYPES
+          value: relational-jdbc
+        - name: QUARKUS_DATASOURCE_JDBC_URL
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: QUARKUS_DATASOURCE_JDBC_URL
+        - name: QUARKUS_DATASOURCE_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: QUARKUS_DATASOURCE_USERNAME
+        - name: QUARKUS_DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: QUARKUS_DATASOURCE_PASSWORD
         volumeMounts:
         - name: polaris-config
           mountPath: /deployments/config
@@ -145,3 +169,108 @@ spec:
     name: management
   selector:
     app: polaris
+
+---
+# ─────────────────────────────────────────────────────────────
+# Polaris Init Job
+# Creates a default Iceberg catalog in Polaris backed by MinIO.
+# Re-runnable and idempotent.
+# ─────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: polaris-init
+  namespace: cdc
+  labels:
+    app: polaris-init
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: polaris-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: polaris-init
+        image: alpine:3.20
+        env:
+        - name: CLIENT_ID
+          value: root
+        - name: CLIENT_SECRET
+          value: s3cr3t
+        - name: REALM
+          value: POLARIS
+        - name: CATALOG_NAME
+          value: quickstart_catalog
+        - name: STORAGE_LOCATION
+          value: s3://iceberg-warehouse/quickstart_catalog
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            apk add --no-cache curl jq
+
+            echo "Waiting for Polaris health endpoint..."
+            until curl -sf http://polaris.cdc.svc.cluster.local:8182/q/health > /dev/null; do
+              sleep 3
+            done
+
+            TOKEN=$(curl --fail-with-body -s \
+              http://polaris.cdc.svc.cluster.local:8181/api/catalog/v1/oauth/tokens \
+              --user ${CLIENT_ID}:${CLIENT_SECRET} \
+              -H "Polaris-Realm: ${REALM}" \
+              -d grant_type=client_credentials \
+              -d scope=PRINCIPAL_ROLE:ALL | jq -r .access_token)
+
+            if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+              echo "Failed to obtain Polaris token"
+              exit 1
+            fi
+
+            if curl -sf \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Polaris-Realm: ${REALM}" \
+              "http://polaris.cdc.svc.cluster.local:8181/api/management/v1/catalogs/${CATALOG_NAME}" > /dev/null; then
+              echo "Catalog ${CATALOG_NAME} already exists, skipping creation"
+              exit 0
+            fi
+
+            PAYLOAD=$(cat <<'JSON'
+            {
+              "catalog": {
+                "name": "quickstart_catalog",
+                "type": "INTERNAL",
+                "readOnly": false,
+                "properties": {
+                  "default-base-location": "s3://iceberg-warehouse/quickstart_catalog"
+                },
+                "storageConfigInfo": {
+                  "storageType": "S3",
+                  "allowedLocations": ["s3://iceberg-warehouse/quickstart_catalog"],
+                  "region": "us-east-1",
+                  "endpoint": "http://minio.cdc.svc.cluster.local:9000",
+                  "pathStyleAccess": true,
+                  "stsUnavailable": true
+                }
+              }
+            }
+            JSON
+            )
+
+            curl --fail-with-body -sS -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Polaris-Realm: ${REALM}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              http://polaris.cdc.svc.cluster.local:8181/api/management/v1/catalogs \
+              -d "${PAYLOAD}"
+
+            echo "Catalog ${CATALOG_NAME} created successfully"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
