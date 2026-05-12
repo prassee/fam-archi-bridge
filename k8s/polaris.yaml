@@ -1,0 +1,147 @@
+---
+# ─────────────────────────────────────────────────────────────
+# Polaris ConfigMap — Quarkus + feature flags (application.properties)
+# Mounted at /deployments/config/application.properties, which Quarkus
+# automatically loads as an additional config source.
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: polaris-config
+  namespace: cdc
+  labels:
+    app: polaris
+data:
+  application.properties: |
+    quarkus.log.file.enabled=false
+    quarkus.otel.sdk.disabled=true
+    polaris.readiness.ignore-severe-issues=true
+    polaris.features."DROP_WITH_PURGE_ENABLED"=true
+    polaris.features."ALLOW_INSECURE_STORAGE_TYPES"=true
+    polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES"=["FILE","S3","GCS","AZURE"]
+    polaris.features."ALLOW_OVERLAPPING_CATALOG_URLS"=true
+    polaris.features."ALLOW_NAMESPACE_CUSTOM_LOCATION"=true
+    polaris.features."ENABLE_CATALOG_FEDERATION"=true
+
+---
+# ─────────────────────────────────────────────────────────────
+# Polaris Secret (bootstrap credentials)
+# CLIENT_ID=root, CLIENT_SECRET=s3cr3t (change for production)
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: polaris-credentials
+  namespace: cdc
+  labels:
+    app: polaris
+type: Opaque
+stringData:
+  # Format: REALM,CLIENT_ID,CLIENT_SECRET
+  POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+
+---
+# ─────────────────────────────────────────────────────────────
+# Apache Polaris Deployment (Iceberg REST catalog)
+# Ports: 8181 (catalog REST API), 8182 (management/health)
+# ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polaris
+  namespace: cdc
+  labels:
+    app: polaris
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: polaris
+  template:
+    metadata:
+      labels:
+        app: polaris
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8182"
+        prometheus.io/path: "/q/metrics"
+    spec:
+      containers:
+      - name: polaris
+        image: apache/polaris:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8181
+          name: catalog
+        - containerPort: 8182
+          name: management
+        env:
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: POLARIS_BOOTSTRAP_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              name: polaris-credentials
+              key: POLARIS_BOOTSTRAP_CREDENTIALS
+        volumeMounts:
+        - name: polaris-config
+          mountPath: /deployments/config
+          readOnly: true
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /q/health/live
+            port: 8182
+          initialDelaySeconds: 60
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /q/health/ready
+            port: 8182
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: polaris-config
+        configMap:
+          name: polaris-config
+
+---
+# ─────────────────────────────────────────────────────────────
+# Polaris Service
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: polaris
+  namespace: cdc
+  labels:
+    app: polaris
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8181
+    targetPort: 8181
+    name: catalog
+  - port: 8182
+    targetPort: 8182
+    name: management
+  selector:
+    app: polaris

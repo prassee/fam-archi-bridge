@@ -11,6 +11,8 @@ resources:
   - deployment.yaml
   - data-pump-go.yaml
   - monitoring.yaml
+  - storage.yaml
+  - polaris.yaml
 
 labels:
   - pairs:
