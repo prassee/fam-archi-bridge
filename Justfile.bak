@@ -1,8 +1,3 @@
-# Install Kite (web-based Kubernetes control plane UI)
-kite-install:
-    @echo "Installing Kite (web-based Kubernetes control plane UI)..."
-    curl -fsSL https://get.k8skite.dev | bash
-    @echo "Kite installation complete. Run 'kite' to start the UI."
 # Justfile for managing WAL Writer services
 # Aligned with docker-compose.yml services
 # ---------------------------------------------------------------------------
@@ -124,16 +119,6 @@ stop-data-pump:
     docker-compose stop data-pump-go
     @echo "Data Pump stopped"
 
-# Stop data-pump-go in Kubernetes
-k8s-stop-data-pump:
-    kubectl scale deployment -n cdc data-pump-go --replicas=0
-    @echo "Data Pump deployment scaled to 0"
-
-# Start data-pump-go in Kubernetes
-k8s-start-data-pump:
-    kubectl scale deployment -n cdc data-pump-go --replicas=1
-    @echo "Data Pump deployment scaled to 1"
-
 # WAL Writer Rust (active CDC agent)
 start-wal-writer:
     docker-compose up -d wal-writer-rust
@@ -250,19 +235,29 @@ config service:
     docker-compose ps {{ service }} || echo "Service not running"
 
 # ---------------------------------------------------------------------------
+# Kind (Kubernetes in Docker) Cluster Management
+
+
+
 # Create a kind cluster named 'matte' with 1 control-plane and 4 worker nodes
-# ---------------------------------------------------------------------------
 kind-create:
-    @echo "Creating kind cluster 'matte' with 1 control-plane and 4 workers..."
-    echo "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n    extraPortMappings:\n      - containerPort: 30080\n        hostPort: 30080\n        protocol: TCP\n  - role: worker\n  - role: worker\n  - role: worker\n  - role: worker" > kind-5node.yaml
-    kind create cluster --name matte --config kind-5node.yaml --wait 120s --image kindest/node:v1.29.2 || true
-    @echo "Kind cluster 'matte' (5 nodes) created (or already exists)"
-    @echo "NodePort 30080 is mapped to localhost:30080 for Kite UI"
+        @echo "Creating kind cluster 'matte' with 1 control-plane and 4 workers..."
+        @cat <<EOF > kind-5node.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+    - role: control-plane
+    - role: worker
+    - role: worker
+    - role: worker
+    - role: worker
+EOF
+        kind create cluster --name matte --config kind-5node.yaml --wait 120s --image kindest/node:v1.29.2 || true
+        @echo "Kind cluster 'matte' (5 nodes) created (or already exists)"
 
 
 # Delete the kind cluster named 'matte'
 kind-delete:
-    @echo "Deleting kind cluster 'matte'..."
     kind delete cluster --name matte
     @echo "Kind cluster 'matte' deleted"
 
@@ -330,18 +325,6 @@ k8s-deploy-monitoring:
     kubectl apply -f k8s/monitoring.yaml
     @echo "Monitoring stack deployed (prometheus, grafana, postgres-exporter, kafka-exporter)"
 
-# Deploy Kite (web-based Kubernetes control plane UI) to the cluster
-k8s-deploy-kite:
-    kubectl apply -f k8s/kite.yaml
-    @echo "Kite deployed to kube-system"
-    @echo "Use 'just k8s-open-kite' for reliable browser access"
-
-# Port-forward Kite UI to localhost:18080 and open in browser
-k8s-open-kite:
-    @echo "Port-forwarding Kite -> http://localhost:18080"
-    @kubectl port-forward -n kube-system svc/kite 18080:8080 &
-    @sleep 2 && open http://localhost:18080 || xdg-open http://localhost:18080
-
 # Port-forward Prometheus to localhost:9091 and open in browser
 k8s-open-prometheus:
     @echo "Port-forwarding Prometheus -> http://localhost:9091"
@@ -358,7 +341,6 @@ k8s-open-grafana:
 k8s-stop-portforwards:
     @pkill -f 'kubectl port-forward.*prometheus' || true
     @pkill -f 'kubectl port-forward.*grafana' || true
-    @pkill -f 'kubectl port-forward.*kite' || true
     @pkill -f 'kubectl port-forward.*minio' || true
     @pkill -f 'kubectl port-forward.*polaris' || true
     @echo "Port-forwards stopped"

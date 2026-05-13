@@ -152,3 +152,18 @@ Now that WAL Writer is stable at ~9,700 msg/s with `confirmed_flush_lsn` advanci
 - Slot lag recovery: steps when `confirmed_flush_lsn` falls behind
 - Slot invalidation: recreate slot + restart wal-writer sequence
 - Redeploy verification: confirm `confirmed_flush_lsn` is non-NULL within 10 s of start
+
+## Table-Level WAL Pause/Resume Behavior
+
+Current design does not provide a table-level pause switch inside wal-writer itself.
+
+What is possible today:
+- Temporarily stop CDC for a specific table by removing that table from the PostgreSQL publication.
+- Resume CDC later by adding the table back to the publication.
+
+Why:
+- wal-writer consumes whatever PostgreSQL emits for the configured publication (`WAL_WRITER_PUBLICATION`).
+- There is no in-app allowlist/denylist filter for `schema.table` in the current Rust runtime path.
+
+Operational implication:
+- Pause/resume for a table is controlled at PostgreSQL publication level, not inside wal-writer process logic.
