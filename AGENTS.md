@@ -12,6 +12,25 @@ High-throughput CDC capture from PostgreSQL WAL with sub-second latency, designe
 | Phase 2 — CDC Capture & Streaming | WAL Cake Agent → Kafka | ✅ Complete |
 | Phase 3 — Data Lake Write | Table Writer → Iceberg → S3 | ❌ Not Started |
 
+### Phase 2 Deployment Status (Kubernetes)
+
+**Cluster**: kind cluster named 'matte' with 5 nodes (1 control-plane, 4 workers), v1.29.2
+
+**Services Deployed**:
+- **PostgreSQL** (postgres-0): 16-alpine, logical replication enabled, 5432 in-cluster, 5GB storage
+- **Kafka** (kafka-0): confluentinc/cp-kafka:7.5.0, KRaft single-broker, ports 9092 (plaintext), 29093 (controller)
+- **data-pump-go**: generating ~5000 UPI txns/sec + Users/Subscriptions/Offers workload
+- **wal-writer** (1 replica): Rust CDC agent, metrics on :9090, connected to postgres + kafka services
+- **Kite**: Web-based Kubernetes UI in kube-system namespace, accessible at http://localhost:18080
+
+**Replication Setup** (manual, not in manifests):
+```bash
+kubectl exec postgres-0 -n cdc -- psql -U postgres -d postgres -c \
+  "SELECT pg_create_logical_replication_slot('wal_writer_slot','pgoutput');"
+kubectl exec postgres-0 -n cdc -- psql -U postgres -d postgres -c \
+  "CREATE PUBLICATION wal_writer_publication FOR ALL TABLES;"
+```
+
 ### Phase 2 Completed Items
 - [x] Wire `WalParser::parse()` into the replication loop end-to-end
 - [x] LSN persistence on commit
@@ -41,7 +60,11 @@ Go Data Pump ──(insert & update)──► PgSQL
 ### Phase 2 — CDC Capture & Streaming ✅ Complete
 The **WAL Cake Agent** (Rust implementation) connects to PostgreSQL via logical replication, consumes the Write-Ahead Log, decodes change events (Insert/Update/Delete/Truncate), and pushes them as structured CDC messages to **Kafka Topics**. Metrics are exported to **Grafana** for observability.
 
+**Docker Compose Deployment:**
 Deployed services: `wal-writer-rust` (Rust CDC agent, metrics exposed at container port `:9090` and host port `:9095`), `kafka` (Confluent CP-Kafka 7.5, auto topic creation enabled on port `9092`).
+
+**Kubernetes Deployment (kind cluster 'matte'):**
+Deployed as StatefulSet with 1 replica (replicas=1 to avoid replication slot contention), service exposure on port 9092 (Kafka), configuration via ConfigMap + Secret, health checks on `/health` endpoint (port 9090).
 
 Verified: the replication loop now parses pgoutput messages end-to-end, acknowledges consumed LSNs back to PostgreSQL, persists commit progress, and publishes CDC events to Kafka topics. Observability is in place through Prometheus, PostgreSQL Exporter, Kafka Exporter, and Grafana dashboards.
 
@@ -70,6 +93,8 @@ If you want I can implement these steps in order. Stopping now as requested.
 
 ## Recent Work
 
+- Fixed wal-writer readiness probe by correcting endpoint from `/ready` (404) to `/health` in k8s/deployment.yaml — app only exposes `/health` and `/metrics` endpoints.
+- Fixed replication slot contention by scaling wal-writer deployment from 2 replicas to 1 replica in k8s/deployment.yaml — multiple pods cannot share single replication slot.
 - Wired the parser into the replication loop end-to-end and verified CDC delivery into Kafka topics.
 - Fixed replication slot advancement by calling `update_applied_lsn()`, allowing PostgreSQL to advance `confirmed_flush_lsn` and recycle WAL.
 - Added `WAL_WRITER_PUBLICATION` configuration, correcting publication selection for logical replication.

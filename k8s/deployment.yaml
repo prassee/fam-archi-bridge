@@ -6,7 +6,7 @@ metadata:
   labels:
     app: wal-writer
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: wal-writer
@@ -151,7 +151,7 @@ spec:
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /ready
+            path: /health
             port: 9090
           initialDelaySeconds: 5
           periodSeconds: 5
