@@ -9,6 +9,7 @@ resources:
   - kafka.yaml
   - db-init.yaml
   - deployment.yaml
+  - wal-consumer.yaml
   - data-pump-go.yaml
   - monitoring.yaml
   - storage.yaml

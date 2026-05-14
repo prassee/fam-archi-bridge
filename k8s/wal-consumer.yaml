@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wal-consumer
+  namespace: cdc
+  labels:
+    app: wal-consumer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wal-consumer
+  template:
+    metadata:
+      labels:
+        app: wal-consumer
+    spec:
+      serviceAccountName: wal-writer
+      containers:
+      - name: wal-consumer
+        image: wal-consumer:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: WAL_WRITER_KAFKA_BROKERS
+          value: kafka.cdc.svc.cluster.local:9092
+        - name: WAL_WRITER_KAFKA_TOPIC_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_TOPIC_PREFIX
+              optional: true
+        - name: WAL_CONSUMER_GROUP_ID
+          value: wal-consumer-console
+        - name: WAL_CONSUMER_WORKERS
+          value: "8"
+        - name: WAL_CONSUMER_COMMIT_EVERY
+          value: "5000"
+        - name: RUST_LOG
+          value: info
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      restartPolicy: Always
