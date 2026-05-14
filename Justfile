@@ -310,6 +310,26 @@ k8s-restart-wal-writer:
     kubectl rollout status deployment/wal-writer -n cdc
     @echo "WAL Writer restarted"
 
+# Rebuild wal-writer image and load it into kind cluster 'matte'
+k8s-rebuild-wal-writer-image:
+    docker build -f wal_writer/Dockerfile -t wal-writer-rust:latest .
+    kind load docker-image wal-writer-rust:latest --name matte
+    @echo "WAL Writer image rebuilt and loaded into kind"
+
+# Roll out wal-writer deployment with latest manifest and image
+k8s-rollout-wal-writer:
+    kubectl apply -f k8s/configmap.yaml
+    kubectl apply -f k8s/deployment.yaml
+    kubectl rollout restart deployment/wal-writer -n cdc
+    kubectl rollout status deployment/wal-writer -n cdc
+    @echo "WAL Writer rolled out"
+
+# Stop wal-writer deployment in Kubernetes
+k8s-stop-wal-writer:
+    kubectl scale deployment -n cdc wal-writer --replicas=0
+    kubectl rollout status deployment/wal-writer -n cdc --timeout=90s || true
+    @echo "WAL Writer scaled to 0"
+
 # View live logs from WAL Writer pods
 k8s-logs-wal-writer:
     kubectl logs -n cdc -l app=wal-writer -f --tail=100

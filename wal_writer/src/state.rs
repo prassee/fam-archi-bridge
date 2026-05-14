@@ -1,13 +1,14 @@
 #![allow(dead_code)]
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use crate::wal_parser::WalRecord;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::fs;
-use serde::{Deserialize, Serialize};
-use crate::wal_parser::WalRecord;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 #[derive(Clone)]
 pub struct LsnTracker {
@@ -44,12 +45,15 @@ impl LsnTracker {
     pub async fn persist(&self, topic: &str, lsn: &str) -> anyhow::Result<()> {
         {
             let mut state = self.state.write().await;
-            state.insert(topic.to_string(), LsnState {
-                last_lsn: lsn.to_string(),
-                last_commit_time: chrono::Utc::now().timestamp(),
-            });
+            state.insert(
+                topic.to_string(),
+                LsnState {
+                    last_lsn: lsn.to_string(),
+                    last_commit_time: chrono::Utc::now().timestamp(),
+                },
+            );
         }
-        
+
         if let Some(path) = &self.store_path {
             let state = self.state.read().await;
             let content = serde_json::to_string(&*state)?;
@@ -113,6 +117,29 @@ impl BatchQueue {
         }
         queue.push_back(batch);
         Ok(())
+    }
+
+    /// Backpressure enqueue: waits until there is capacity instead of failing fast.
+    /// Returns how many wait iterations were needed before enqueue succeeded.
+    pub async fn enqueue_with_backpressure(
+        &self,
+        batch: PendingBatch,
+        wait_step_ms: u64,
+    ) -> anyhow::Result<u64> {
+        let mut wait_iterations = 0u64;
+
+        loop {
+            {
+                let mut queue = self.pending.write().await;
+                if queue.len() < self.max_pending_batches {
+                    queue.push_back(batch);
+                    return Ok(wait_iterations);
+                }
+            }
+
+            wait_iterations += 1;
+            sleep(Duration::from_millis(wait_step_ms.max(1))).await;
+        }
     }
 
     pub async fn enqueue_front(&self, batch: PendingBatch) -> anyhow::Result<()> {

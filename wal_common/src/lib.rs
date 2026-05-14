@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub replication: ReplicationConfig,
     pub logging: LoggingConfig,
     pub state: StateConfig,
+    pub pending_batch_queue_size: usize,
 }
 
 impl AppConfig {
@@ -26,6 +27,11 @@ impl AppConfig {
             .unwrap_or_else(|_| "/var/log/wal-writer".to_string());
         let logging_level =
             env::var("WAL_WRITER_LOGGING_LEVEL").unwrap_or_else(|_| "info".to_string());
+
+        let pending_batch_queue_size = env::var("WAL_WRITER_PENDING_BATCH_QUEUE_SIZE")
+            .unwrap_or_else(|_| "1000".to_string())
+            .parse()
+            .unwrap_or(1000);
 
         Ok(Self {
             pg: PostgresConfig {
@@ -87,6 +93,7 @@ impl AppConfig {
                     .parse()
                     .unwrap_or(60),
             },
+            pending_batch_queue_size,
         })
     }
 }

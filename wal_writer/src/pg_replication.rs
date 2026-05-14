@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -60,7 +60,7 @@ impl WalReader {
             .map(|d| d.join("wal_position.json"));
 
         let lsn_tracker = LsnTracker::new(state_path);
-        let batch_queue = BatchQueue::new(1000); // Max 1000 pending batches
+        let batch_queue = BatchQueue::new(config.pending_batch_queue_size);
 
         // Read batch config from AppConfig
         let batch_config = BatchConfig {
@@ -271,24 +271,23 @@ impl WalReader {
                                     );
 
                                     for batch in batches {
-                                        match batch_queue.enqueue(batch).await {
-                                            Ok(()) => {
-                                                debug!("Batch queued for Kafka publish (pending={})", batch_queue.count().await);
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to queue batch for topic='{}' table='{}.{}': {}",
-                                                    topic,
-                                                    _schema,
-                                                    _table,
-                                                    e
-                                                );
-                                                metrics.process_wal_errors_inc();
-                                                return Err(anyhow!(
-                                                    "pending batch queue overflow, refusing to continue: {}",
-                                                    e
-                                                ));
-                                            }
+                                        let wait_iterations = batch_queue
+                                            .enqueue_with_backpressure(batch, 5)
+                                            .await
+                                            .context("Failed to enqueue batch with backpressure")?;
+
+                                        if wait_iterations > 0 {
+                                            let waited_ms = wait_iterations * 5;
+                                            warn!(
+                                                "Applied backpressure while queueing batch for topic='{}' table='{}.{}': waited {} ms (pending={})",
+                                                topic,
+                                                _schema,
+                                                _table,
+                                                waited_ms,
+                                                batch_queue.count().await
+                                            );
+                                        } else {
+                                            debug!("Batch queued for Kafka publish (pending={})", batch_queue.count().await);
                                         }
                                     }
                                 }
