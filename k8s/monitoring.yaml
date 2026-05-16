@@ -37,6 +37,12 @@ data:
         metrics_path: /metrics
         scrape_interval: 5s
 
+      - job_name: 'promtail'
+        static_configs:
+          - targets: ['promtail.cdc.svc.cluster.local:3101']
+        metrics_path: /metrics
+        scrape_interval: 5s
+
 ---
 # ─────────────────────────────────────────────────────────────
 # Prometheus Deployment + Service
@@ -244,6 +250,13 @@ data:
         access: proxy
         url: http://prometheus.cdc.svc.cluster.local:9090
         isDefault: true
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki.cdc.svc.cluster.local:3100
+        isDefault: false
+        jsonData:
+          maxLines: 1000
 
 ---
 # ─────────────────────────────────────────────────────────────

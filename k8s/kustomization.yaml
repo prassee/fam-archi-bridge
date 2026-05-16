@@ -12,8 +12,9 @@ resources:
   - wal-consumer.yaml
   - data-pump-go.yaml
   - monitoring.yaml
+  - loki.yaml
+  - promtail.yaml
   - storage.yaml
-  - polaris.yaml
 
 labels:
   - pairs:

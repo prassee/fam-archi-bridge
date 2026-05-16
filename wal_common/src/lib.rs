@@ -81,6 +81,10 @@ impl AppConfig {
                 enable_dlq: env::var("WAL_WRITER_ENABLE_DLQ")
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true),
+                num_publishers: env::var("WAL_WRITER_NUM_PUBLISHERS")
+                    .unwrap_or_else(|_| "4".to_string())
+                    .parse()
+                    .unwrap_or(4),
             },
             replication: ReplicationConfig {
                 publication: env::var("WAL_WRITER_PUBLICATION")
@@ -142,6 +146,7 @@ pub struct KafkaConfig {
     pub publish_raw_wal: bool,
     pub max_publish_retries: u32,
     pub enable_dlq: bool,
+    pub num_publishers: usize,
 }
 
 impl KafkaConfig {

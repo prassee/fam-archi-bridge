@@ -12,7 +12,7 @@ use wal_common::AppConfig;
 use crate::decoder::WalDecoder;
 use crate::kafka::KafkaProducer;
 use crate::metrics::Metrics;
-use crate::state::{BatchConfig, BatchQueue, LsnTracker, PendingBatch};
+use crate::state::{BatchConfig, BatchQueue, BatchQueueRouter, LsnTracker, PendingBatch};
 use crate::wal_parser::{WalParser, WalRecord};
 
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
@@ -22,7 +22,7 @@ pub struct WalReader {
     decoder: WalDecoder,
     lsn_tracker: LsnTracker,
     metrics: Metrics,
-    batch_queue: BatchQueue,
+    batch_queue_router: BatchQueueRouter,
     batch_config: BatchConfig,
 }
 
@@ -60,7 +60,8 @@ impl WalReader {
             .map(|d| d.join("wal_position.json"));
 
         let lsn_tracker = LsnTracker::new(state_path);
-        let batch_queue = BatchQueue::new(config.pending_batch_queue_size);
+        let batch_queue_router =
+            BatchQueueRouter::new(config.kafka.num_publishers, config.pending_batch_queue_size);
 
         // Read batch config from AppConfig
         let batch_config = BatchConfig {
@@ -73,7 +74,7 @@ impl WalReader {
             decoder: WalDecoder::new(kafka_producer, metrics.clone()),
             lsn_tracker,
             metrics,
-            batch_queue,
+            batch_queue_router,
             batch_config,
         }
     }
@@ -129,7 +130,7 @@ impl WalReader {
         let decoder = self.decoder.clone();
         let lsn_tracker = self.lsn_tracker.clone();
         let metrics = self.metrics.clone();
-        let batch_queue = self.batch_queue.clone();
+        let batch_queue_router = self.batch_queue_router.clone();
 
         let mut _total_wal_bytes: u64 = 0;
         let mut _total_records_parsed: u64 = 0;
@@ -142,27 +143,36 @@ impl WalReader {
 
         info!("WAL reader loop started — waiting for replication events");
 
-        // Spawn background batch publisher task
-        let publisher_decoder = decoder.clone();
-        let publisher_batch_queue = batch_queue.clone();
-        let publisher_lsn_tracker = lsn_tracker.clone();
-        let publisher_metrics = metrics.clone();
-        let publisher_slot_name = slot_name.clone();
-        let publisher_batch_config = self.batch_config.clone();
-        let publisher_ack_sender = ack_sender.clone();
+        // Spawn multiple parallel batch publisher tasks
+        let num_publishers = self.config.kafka.num_publishers;
+        info!(
+            "Spawning {} parallel batch publisher task(s) with per-topic affinity",
+            num_publishers
+        );
 
-        let _publisher_handle = tokio::spawn(async move {
-            batch_publisher_loop(
-                publisher_decoder,
-                publisher_batch_queue,
-                publisher_lsn_tracker,
-                publisher_metrics,
-                publisher_slot_name,
-                publisher_batch_config,
-                publisher_ack_sender,
-            )
-            .await
-        });
+        for publisher_id in 0..num_publishers {
+            let publisher_decoder = decoder.clone();
+            let publisher_batch_queue = batch_queue_router.get_queue(publisher_id);
+            let publisher_lsn_tracker = lsn_tracker.clone();
+            let publisher_metrics = metrics.clone();
+            let publisher_slot_name = slot_name.clone();
+            let publisher_batch_config = self.batch_config.clone();
+            let publisher_ack_sender = ack_sender.clone();
+
+            tokio::spawn(async move {
+                info!("Publisher task {} started", publisher_id);
+                batch_publisher_loop(
+                    publisher_decoder,
+                    publisher_batch_queue,
+                    publisher_lsn_tracker,
+                    publisher_metrics,
+                    publisher_slot_name,
+                    publisher_batch_config,
+                    publisher_ack_sender,
+                )
+                .await
+            });
+        }
 
         // Receive replication events
         loop {
@@ -271,7 +281,7 @@ impl WalReader {
                                     );
 
                                     for batch in batches {
-                                        let wait_iterations = batch_queue
+                                        let wait_iterations = batch_queue_router
                                             .enqueue_with_backpressure(batch, 5)
                                             .await
                                             .context("Failed to enqueue batch with backpressure")?;
@@ -284,10 +294,10 @@ impl WalReader {
                                                 _schema,
                                                 _table,
                                                 waited_ms,
-                                                batch_queue.count().await
+                                                batch_queue_router.total_count().await
                                             );
                                         } else {
-                                            debug!("Batch queued for Kafka publish (pending={})", batch_queue.count().await);
+                                            debug!("Batch queued for Kafka publish (pending={})", batch_queue_router.total_count().await);
                                         }
                                     }
                                 }
@@ -329,7 +339,7 @@ impl WalReader {
                         "Commit at LSN {} (end LSN {}) — pending batch queue size={}",
                         lsn.as_u64(),
                         end_lsn.as_u64(),
-                        batch_queue.count().await
+                        batch_queue_router.total_count().await
                     );
                 }
                 Some(ReplicationEvent::KeepAlive {
@@ -342,7 +352,7 @@ impl WalReader {
                         "Keepalive at {} reply_requested={} pending_batches={}",
                         wal_end.as_u64(),
                         reply_requested,
-                        batch_queue.count().await
+                        batch_queue_router.total_count().await
                     );
 
                     // CRITICAL FIX: Send status response when PostgreSQL requests it

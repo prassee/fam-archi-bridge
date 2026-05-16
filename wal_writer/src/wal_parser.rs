@@ -3,6 +3,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use pg_walstream::BufferReader;
 use pg_walstream::RelationInfo;
@@ -74,11 +75,16 @@ pub enum ColumnValue {
     Bytes(Vec<u8>),
 }
 
-pub struct WalParser {}
+#[derive(Clone)]
+pub struct WalParser {
+    relations: Arc<Mutex<HashMap<u32, RelationInfo>>>,
+}
 
 impl WalParser {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            relations: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Parse pgoutput bytes into WalRecord items. Attaches relation metadata
@@ -92,7 +98,7 @@ impl WalParser {
             return Ok(records);
         }
 
-        let mut relations: HashMap<u32, RelationInfo> = HashMap::new();
+        let mut relations = self.relations.lock().unwrap();
 
         let mut current_xid: u64 = 0;
         let mut current_commit_time: i64 = 0;

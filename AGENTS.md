@@ -320,3 +320,212 @@ The codebase is **production-grade and ready to scale**. The LSN ACK stall was a
 - 🌊 Build Phase 3 Iceberg data lake in parallel
 
 **Documentation provides clear paths for all scenarios. You have high confidence to proceed.**
+
+---
+
+## Future Improvements (v2.0 / v3.0)
+
+### Per-Topic Affinity Hashing (v1.1 - In Progress)
+
+**Current Implementation:**
+- Fixed 4 parallel publishers with deterministic topic → publisher hash
+- Each topic always routes to same publisher → **causal ordering guaranteed per table**
+- Concurrent sends across different tables (4x parallelism)
+
+**Design Rationale:**
+```
+Transaction A: UPDATE users SET balance=100 (LSN 100) → Publisher 0
+Transaction B: UPDATE users SET balance=200 (LSN 200) → Publisher 0
+Result: B always arrives after A (same publisher dequeues sequentially)
+```
+
+---
+
+### Adaptive Publisher Sizing (v2.0 - Planned)
+
+**Problem with Fixed 4 Publishers:**
+```
+2 tables     → 4 publishers (50% utilization)
+10 tables    → 4 publishers (2.5 tables/pub, skewed load)
+100 tables   → 4 publishers (25 tables/pub, severe contention)
+```
+
+**Solution: Query table count at startup, size publishers proportionally**
+
+```rust
+// Pseudocode
+let num_tables = query_postgres_table_count().await?;
+let num_publishers = (num_tables / 5).max(1).min(16);
+// 1 publisher per 5 tables, capped at 16 (tradeoff: connections vs throughput)
+```
+
+**Expected Impact:**
+```
+2 tables     → 1 publisher (optimal)
+10 tables    → 2 publishers (balanced)
+50 tables    → 10 publishers (peak efficiency)
+100+ tables  → 16 publishers (diminishing returns beyond 16)
+```
+
+**Implementation Steps:**
+1. Add PostgreSQL query to count tables: `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_*')`
+2. Calculate optimal publisher count using heuristic: `(count / 5).max(1).min(16)`
+3. Update `BatchQueueRouter` to spawn dynamic count instead of fixed 4
+4. Log publisher allocation at startup for debugging
+5. Add metric: `wal_writer_num_publishers_allocated` (gauge)
+
+**Tradeoff Analysis:**
+- **Pros:** Optimal load distribution, zero wasted publisher capacity, linear throughput scaling
+- **Cons:** More Kafka connections (100 tables = 20 connections), ~50MB more memory per publisher, slightly higher per-table latency variance
+- **Recommended for:** Deployments with 20+ tables
+
+---
+
+### Per-Topic Queue Sizing (v2.0 - Planned)
+
+**Current:** Single queue size shared across all topics/publishers
+
+**Improvement:** Size queue per publisher based on expected table write volume
+
+```rust
+struct PublisherConfig {
+    publisher_id: usize,
+    assigned_topics: Vec<String>,
+    queue_size: usize,  // Dynamically sized
+    max_batch_size: usize,
+}
+```
+
+**Strategy:**
+1. At startup, query PostgreSQL for write frequency per table (from WAL stats)
+2. Assign higher queue size to high-volume tables
+3. Lower queue size to low-volume tables (saves memory)
+
+**Expected Impact:**
+- Reduced queue memory footprint by 30-50% for low-volume tables
+- Better backpressure distribution
+- Faster response time for high-priority tables
+
+---
+
+### Hot-Table Detection & Prioritization (v2.0/v3.0 - Planned)
+
+**Idea:** Dynamically detect hot tables and prioritize their publisher threads
+
+```rust
+if table_write_rate > threshold {
+    // Boost priority of publisher handling this table
+    increase_publisher_cpu_weight(publisher_id);
+    decrease_batch_coalesce_time(publisher_id);  // Flush faster
+}
+```
+
+**Metrics to Track:**
+- `wal_writer_table_write_rate_records_per_sec` (per table)
+- `wal_writer_publisher_latency_ms` (per publisher)
+- `wal_writer_queue_saturation_percent` (per publisher)
+
+**Benefits:**
+- UPI transactions (high volume) get lower latency than metadata updates
+- Automatic load balancing without config changes
+- Early warning system for throughput bottlenecks
+
+---
+
+### Compression Strategy Optimization (v2.0 - Planned)
+
+**Current:** Static snappy compression enabled globally
+
+**Improvement: Adaptive compression per topic**
+
+```rust
+if payload_size > threshold {
+    use_compression = true;  // Large batches benefit from snappy
+} else {
+    use_compression = false; // Small batches: compression overhead > savings
+}
+```
+
+**Per-Topic Config:**
+```yaml
+compression_strategy:
+  cdc.public.upi_transactions: "snappy"      # High volume, high compression ratio
+  cdc.public.users: "lz4"                    # Medium volume, faster
+  cdc.public.metadata: "none"                # Low volume, skip overhead
+```
+
+**Expected Impact:**
+- 15-20% reduction in network bandwidth
+- 10-15% CPU overhead (usually worth it for 10k+ msg/sec)
+- Configuration knob for workload-specific tuning
+
+---
+
+### Multi-DC Replication & Cross-Region Failover (v3.0 - Planned)
+
+**Architecture:**
+```
+Primary DC (us-west):
+  PostgreSQL → wal-writer → Kafka Cluster A
+         ↓
+Secondary DC (us-east) [Warm Standby]:
+  wal-writer [read replica replication slot] → Kafka Cluster B
+         ↓
+Tertiary DC (eu-central) [Cold Standby]:
+  wal-writer [replication slot from Kafka Cluster B] → Kafka Cluster C
+```
+
+**Key Design Points:**
+- Primary: Real-time replication from PostgreSQL WAL
+- Secondary: Consume from Primary's Kafka, write to Secondary Kafka (acts as cache)
+- Tertiary: Optional cold standby consuming from Secondary
+
+**Failover Logic:**
+```
+Primary DB healthy? → Write to Primary DC Kafka
+Primary down? → Promote Secondary DC
+    Prevent split-brain via zookeeper-style quorum
+    Wait for Primary confirmed LSN to stabilize
+    Verify Secondary has consumed all pending LSNs
+    → Promote Secondary to Primary
+```
+
+**Implementation:**
+1. Add `--replica-mode` flag to wal-writer
+2. Implement cross-cluster offset tracking
+3. Add leader election logic (Kubernetes StatefulSet leader)
+4. Implement graceful demotion on primary recovery
+
+---
+
+### Performance Targets (Post v2.0/v3.0)
+
+| Metric | v1.0 | v2.0 Target | v3.0 Target |
+|--------|------|-------------|-------------|
+| **Throughput** | ~20k msg/s | 50k+ msg/s | 100k+ msg/s |
+| **Latency p99** | <2s | <500ms | <100ms |
+| **# Publishers** | Fixed 4 | Adaptive (1-16) | Adaptive (1-32) |
+| **Max Tables** | ~50 | ~200 | ~1000 |
+| **Failover Time** | N/A | ~30s | ~10s |
+| **Multi-DC Support** | No | Warm standby | Full HA |
+
+---
+
+### Roadmap Priority
+
+**v1.1 (Next 1 week):**
+- ✅ Per-topic affinity hashing (DONE)
+- Deploy and verify 4x concurrent publishers
+- Monitor latency & queue saturation
+
+**v2.0 (3-4 weeks):**
+- Adaptive publisher sizing
+- Per-topic queue sizing
+- Hot-table detection
+- Compression strategy optimization
+
+**v3.0 (6-8 weeks):**
+- Multi-DC replication
+- Cross-region failover
+- Advanced telemetry & alerting
+- Performance tuning to 100k+ msg/sec

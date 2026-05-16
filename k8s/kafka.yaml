@@ -23,6 +23,7 @@ metadata:
 spec:
   serviceName: kafka
   replicas: 1
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       app: kafka
@@ -35,26 +36,34 @@ spec:
       containers:
       - name: kafka
         image: confluentinc/cp-kafka:7.5.0
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          ORDINAL=$(hostname | grep -o '[0-9]*$')
+          NODE_ID=$((ORDINAL + 1))
+          POD_FQDN=$(hostname).kafka.cdc.svc.cluster.local
+          echo "Starting Kafka with NODE_ID=$NODE_ID (ordinal=$ORDINAL, FQDN=$POD_FQDN)"
+          export KAFKA_NODE_ID=$NODE_ID
+          export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${POD_FQDN}:9092"
+          exec /etc/confluent/docker/run
         ports:
         - containerPort: 9092
           name: plaintext
         - containerPort: 29093
           name: controller
         env:
-        - name: KAFKA_NODE_ID
-          value: "1"
         - name: KAFKA_PROCESS_ROLES
           value: "broker,controller"
         - name: KAFKA_CONTROLLER_LISTENER_NAMES
           value: "CONTROLLER"
         - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-          value: "1@kafka:29093"
+          value: "1@kafka-0.kafka.cdc.svc.cluster.local:29093"
         - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
           value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
         - name: KAFKA_LISTENERS
           value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
-        - name: KAFKA_ADVERTISED_LISTENERS
-          value: "PLAINTEXT://kafka.cdc.svc.cluster.local:9092"
         - name: KAFKA_INTER_BROKER_LISTENER_NAME
           value: "PLAINTEXT"
         - name: CLUSTER_ID
@@ -83,6 +92,21 @@ spec:
         volumeMounts:
         - name: kafka-data
           mountPath: /var/lib/kafka/data
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 1
+        livenessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 5
+      volumes: []
   volumeClaimTemplates:
   - metadata:
       name: kafka-data

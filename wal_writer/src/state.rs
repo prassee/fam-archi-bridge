@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 use crate::wal_parser::WalRecord;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,6 +163,67 @@ impl BatchQueue {
 
     pub async fn count(&self) -> usize {
         self.pending.read().await.len()
+    }
+}
+
+/// Multi-queue router that maintains per-topic causal ordering while enabling parallel publishers.
+/// Each topic is deterministically hashed to a specific queue (0-3), ensuring all batches for
+/// the same table always go to the same publisher.
+#[derive(Clone)]
+pub struct BatchQueueRouter {
+    queues: Vec<BatchQueue>,
+    num_publishers: usize,
+}
+
+impl BatchQueueRouter {
+    pub fn new(num_publishers: usize, max_pending_per_queue: usize) -> Self {
+        let queues = (0..num_publishers)
+            .map(|_| BatchQueue::new(max_pending_per_queue))
+            .collect();
+
+        Self {
+            queues,
+            num_publishers,
+        }
+    }
+
+    /// Hash topic to determine which publisher queue it should use
+    fn topic_to_queue_index(&self, topic: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        topic.hash(&mut hasher);
+        (hasher.finish() as usize) % self.num_publishers
+    }
+
+    /// Enqueue batch to the queue assigned for its topic
+    pub async fn enqueue(&self, batch: PendingBatch) -> anyhow::Result<()> {
+        let queue_idx = self.topic_to_queue_index(&batch.topic);
+        self.queues[queue_idx].enqueue(batch).await
+    }
+
+    /// Enqueue with backpressure to the queue assigned for its topic
+    pub async fn enqueue_with_backpressure(
+        &self,
+        batch: PendingBatch,
+        wait_step_ms: u64,
+    ) -> anyhow::Result<u64> {
+        let queue_idx = self.topic_to_queue_index(&batch.topic);
+        self.queues[queue_idx]
+            .enqueue_with_backpressure(batch, wait_step_ms)
+            .await
+    }
+
+    /// Get the queue for a specific publisher ID
+    pub fn get_queue(&self, publisher_id: usize) -> BatchQueue {
+        self.queues[publisher_id].clone()
+    }
+
+    /// Get count across all queues for monitoring
+    pub async fn total_count(&self) -> usize {
+        let mut total = 0;
+        for queue in &self.queues {
+            total += queue.count().await;
+        }
+        total
     }
 }
 

@@ -32,18 +32,18 @@ spec:
         - name: DB_NAME
           value: postgres
         - name: DATA_PUMP_TARGET_PER_SEC
-          value: "5000"
+          value: "7500"
         - name: DATA_PUMP_BATCH_SIZE
           value: "500"
         - name: DATA_PUMP_USERS_BATCH_SIZE
           value: "100"
         - name: DATA_PUMP_NUM_WORKERS
-          value: "20"
+          value: "30"
         resources:
           requests:
-            cpu: 100m
-            memory: 128Mi
-          limits:
-            cpu: 500m
+            cpu: 200m
             memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
       restartPolicy: Always
