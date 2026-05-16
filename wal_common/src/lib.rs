@@ -74,6 +74,13 @@ impl AppConfig {
                 publish_raw_wal: env::var("WAL_WRITER_PUBLISH_RAW_WAL")
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false),
+                max_publish_retries: env::var("WAL_WRITER_MAX_PUBLISH_RETRIES")
+                    .unwrap_or_else(|_| "5".to_string())
+                    .parse()
+                    .unwrap_or(5),
+                enable_dlq: env::var("WAL_WRITER_ENABLE_DLQ")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true),
             },
             replication: ReplicationConfig {
                 publication: env::var("WAL_WRITER_PUBLICATION")
@@ -133,6 +140,8 @@ pub struct KafkaConfig {
     pub debug_no_kafka: bool,
     pub debug_print_wal: bool,
     pub publish_raw_wal: bool,
+    pub max_publish_retries: u32,
+    pub enable_dlq: bool,
 }
 
 impl KafkaConfig {

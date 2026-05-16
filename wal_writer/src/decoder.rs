@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use futures;
 use tokio::time;
 use tracing::{debug, error, warn};
 
@@ -135,7 +136,8 @@ impl WalDecoder {
                 Ok(()) => {
                     let highest_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
                     self.metrics.set_last_process_lsn(highest_lsn);
-                    self.metrics.observe_publish_duration(publish_start.elapsed());
+                    self.metrics
+                        .observe_publish_duration(publish_start.elapsed());
                     return Ok(highest_lsn);
                 }
                 Err(e) => {
@@ -165,7 +167,7 @@ impl WalDecoder {
         }
     }
 
-    /// Helper: Send all records in batch to Kafka (one message per record)
+    /// Helper: Send all records in batch to Kafka (concurrent sends, not sequential)
     async fn send_batch_to_kafka(
         &self,
         topic: &str,
@@ -175,14 +177,35 @@ impl WalDecoder {
             return Ok(());
         }
 
+        // Prepare all sends concurrently instead of sequentially
+        let mut futures = Vec::with_capacity(records.len());
         for record in records {
             let key = record.tx_xid.to_string();
             let value = serde_json::to_string(&record)
                 .map_err(|e| rdkafka::error::KafkaError::ClientCreation(e.to_string()))?;
-            self.kafka.send(topic, &key, &value).await?;
-            self.metrics.kafka_messages_sent_inc();
-            self.metrics.published_record_inc(record.operation.clone());
+            let kafka = self.kafka.clone();
+            let topic_clone = topic.to_string();
+            let metrics = self.metrics.clone();
+            let op = record.operation.clone();
+
+            futures.push(async move {
+                match kafka.send(&topic_clone, &key, &value).await {
+                    Ok(()) => {
+                        metrics.kafka_messages_sent_inc();
+                        metrics.published_record_inc(op);
+                        Ok::<(), rdkafka::error::KafkaError>(())
+                    }
+                    Err(e) => Err(e),
+                }
+            });
         }
+
+        // Execute all sends concurrently
+        let results = futures::future::join_all(futures).await;
+        for result in results {
+            result?;
+        }
+
         Ok(())
     }
 

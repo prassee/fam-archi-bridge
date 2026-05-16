@@ -359,3 +359,1520 @@ data:
         disableDeletion: false
         options:
           path: /var/lib/grafana/dashboards
+
+---
+# ─────────────────────────────────────────────────────────────
+# Grafana dashboard JSON ConfigMap
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-json
+  namespace: cdc
+  labels:
+    app: grafana
+data:
+  postgres-monitoring.json: |
+    {
+      "annotations": {
+        "list": []
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "links": [],
+      "panels": [
+        {
+          "title": "PostgreSQL Up",
+          "type": "stat",
+          "targets": [
+            {
+              "expr": "pg_up",
+              "legendFormat": "pg_up"
+            }
+          ],
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 0,
+            "y": 0
+          },
+          "options": {
+            "colorMode": "background"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "DOWN",
+                      "color": "red"
+                    }
+                  }
+                },
+                {
+                  "type": "value",
+                  "options": {
+                    "1": {
+                      "text": "UP",
+                      "color": "green"
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "title": "Active Connections",
+          "type": "stat",
+          "targets": [
+            {
+              "expr": "sum(pg_stat_activity_count{datname=\"postgres\",state!=\"disabled\"})",
+              "legendFormat": "connections"
+            }
+          ],
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 6,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "red",
+                    "value": 100
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "title": "Replication Slot Active",
+          "type": "stat",
+          "targets": [
+            {
+              "expr": "pg_replication_slot_slot_is_active{slot_name=~\"wal_writer_slot.*\"}",
+              "legendFormat": "{{slot_name}}"
+            }
+          ],
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 12,
+            "y": 0
+          },
+          "options": {
+            "colorMode": "background"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "INACTIVE",
+                      "color": "red"
+                    }
+                  }
+                },
+                {
+                  "type": "value",
+                  "options": {
+                    "1": {
+                      "text": "ACTIVE",
+                      "color": "green"
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "title": "Slot Lag Now (GB)",
+          "type": "stat",
+          "targets": [
+            {
+              "expr": "pg_replication_slots_pg_wal_lsn_diff{slot_name=~\"wal_writer_slot.*\"} / 1073741824",
+              "legendFormat": "{{slot_name}}"
+            }
+          ],
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 18,
+            "y": 0
+          },
+          "options": {
+            "colorMode": "background"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "gbytes",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 1
+                  },
+                  {
+                    "color": "red",
+                    "value": 3
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "title": "WAL Size (GB)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_wal_size_bytes / 1073741824",
+              "legendFormat": "WAL Size"
+            }
+          ],
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "gbytes"
+            }
+          }
+        },
+        {
+          "title": "Slot Lag Over Time (GB)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_replication_slots_pg_wal_lsn_diff{slot_name=~\"wal_writer_slot.*\"} / 1073741824",
+              "legendFormat": "{{slot_name}}"
+            }
+          ],
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "gbytes"
+            }
+          }
+        },
+        {
+          "title": "Database Size (GB)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_database_size_bytes{datname!~\"template.*\"} / 1073741824",
+              "legendFormat": "{{datname}}"
+            }
+          ],
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 12
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "gbytes"
+            }
+          }
+        },
+        {
+          "title": "Slot LSN Position",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_replication_slot_slot_confirmed_flush_lsn{slot_name=~\"wal_writer_slot.*\"}",
+              "legendFormat": "{{slot_name}} confirmed_flush_lsn"
+            },
+            {
+              "expr": "pg_replication_slot_slot_current_wal_lsn{slot_name=~\"wal_writer_slot.*\"}",
+              "legendFormat": "{{slot_name}} current_wal_lsn"
+            }
+          ],
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 12
+          }
+        },
+        {
+          "title": "WAL Sender LSN Diff (bytes)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_stat_replication_pg_wal_lsn_diff",
+              "legendFormat": "{{application_name}} {{state}} slot={{slot_name}}"
+            }
+          ],
+          "gridPos": {
+            "h": 6,
+            "w": 12,
+            "x": 0,
+            "y": 20
+          }
+        },
+        {
+          "title": "Safe WAL Size Remaining (GB)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "pg_replication_slot_safe_wal_size_bytes{slot_name=~\"wal_writer_slot.*\"} / 1073741824",
+              "legendFormat": "{{slot_name}}"
+            }
+          ],
+          "gridPos": {
+            "h": 6,
+            "w": 12,
+            "x": 12,
+            "y": 20
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "gbytes"
+            }
+          }
+        }
+      ],
+      "schemaVersion": 38,
+      "tags": [],
+      "templating": {
+        "list": []
+      },
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "title": "PostgreSQL Monitoring",
+      "uid": "postgres-monitoring",
+      "refresh": "5s"
+    }
+  kafka-exporter.json: |
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": "Prometheus",
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "description": "Kafka resource usage and throughput",
+      "editable": true,
+      "gnetId": 7589,
+      "graphTooltip": 0,
+      "id": null,
+      "iteration": 1534749840410,
+      "links": [],
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 0,
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "id": 14,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "sort": "max",
+            "sortDesc": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "connected",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(rate(kafka_topic_partition_current_offset{instance=\"$instance\", topic!=\"__consumer_offsets\"}[1m])) by (topic)",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "{{topic}}",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "Rate by Topic",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "buckets": null,
+            "mode": "time",
+            "name": null,
+            "show": true,
+            "values": []
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": "0",
+              "show": true
+            },
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            }
+          ],
+          "yaxis": {
+            "align": false,
+            "alignLevel": null
+          }
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 0,
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "id": 12,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "sort": "max",
+            "sortDesc": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "connected",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(kafka_consumergroup_lag{instance=\"$instance\"}) by (consumergroup, topic) ",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "intervalFactor": 1,
+              "legendFormat": "{{consumergroup}} ({{topic}})",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "Lag by Consumer Group",
+          "tooltip": {
+            "shared": true,
+            "sort": 2,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "buckets": null,
+            "mode": "time",
+            "name": null,
+            "show": true,
+            "values": []
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "label": "",
+              "logBase": 1,
+              "max": null,
+              "min": "0",
+              "show": true
+            },
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            }
+          ],
+          "yaxis": {
+            "align": false,
+            "alignLevel": null
+          }
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 9
+          },
+          "id": 16,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "connected",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(delta(kafka_consumergroup_current_offset{instance=~'$instance'}[5m])) by (topic)",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "{{topic}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "Production (5 minutes)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "buckets": null,
+            "mode": "time",
+            "name": null,
+            "show": true,
+            "values": []
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            },
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            }
+          ],
+          "yaxis": {
+            "align": false,
+            "alignLevel": null
+          }
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 9
+          },
+          "id": 18,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "connected",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(delta(kafka_consumergroup_current_offset{instance=~'$instance'}[5m])) by (consumergroup, topic)",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "{{consumergroup}} ({{topic}})",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "Consume (5 minutes)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "buckets": null,
+            "mode": "time",
+            "name": null,
+            "show": true,
+            "values": []
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            },
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            }
+          ],
+          "yaxis": {
+            "align": false,
+            "alignLevel": null
+          }
+        },
+        {
+          "aliasColors": {},
+          "bars": true,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 18
+          },
+          "id": 8,
+          "legend": {
+            "alignAsTable": false,
+            "avg": false,
+            "current": false,
+            "max": false,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": false
+          },
+          "lines": false,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum by(topic) (kafka_topic_partitions{instance=\"$instance\",topic!=\"__consumer_offsets\"})",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "{{topic}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "Partitions per Topic",
+          "tooltip": {
+            "shared": false,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "buckets": null,
+            "mode": "series",
+            "name": null,
+            "show": false,
+            "values": [
+              "current"
+            ]
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            },
+            {
+              "format": "short",
+              "label": null,
+              "logBase": 1,
+              "max": null,
+              "min": null,
+              "show": true
+            }
+          ],
+          "yaxis": {
+            "align": false,
+            "alignLevel": null
+          }
+        }
+      ],
+      "refresh": false,
+      "schemaVersion": 16,
+      "style": "dark",
+      "tags": [
+        "Kafka"
+      ],
+      "templating": {
+        "list": [
+          {
+            "allValue": null,
+            "current": {},
+            "datasource": "Prometheus",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Job",
+            "multi": false,
+            "name": "job",
+            "options": [],
+            "query": "label_values(kafka_consumergroup_current_offset, job)",
+            "refresh": 1,
+            "regex": "",
+            "sort": 0,
+            "tagValuesQuery": "",
+            "tags": [],
+            "tagsQuery": "",
+            "type": "query",
+            "useTags": false
+          },
+          {
+            "allValue": null,
+            "current": {},
+            "datasource": "Prometheus",
+            "hide": 0,
+            "includeAll": false,
+            "label": "Instance",
+            "multi": false,
+            "name": "instance",
+            "options": [],
+            "query": "label_values(kafka_consumergroup_current_offset{job=~\"$job\"}, instance)",
+            "refresh": 1,
+            "regex": "",
+            "sort": 0,
+            "tagValuesQuery": "",
+            "tags": [],
+            "tagsQuery": "",
+            "type": "query",
+            "useTags": false
+          }
+        ]
+      },
+      "time": {
+        "from": "now-6h",
+        "to": "now"
+      },
+      "timepicker": {
+        "refresh_intervals": [
+          "5s",
+          "10s",
+          "30s",
+          "1m",
+          "5m",
+          "15m",
+          "30m",
+          "1h",
+          "2h",
+          "1d"
+        ],
+        "time_options": [
+          "5m",
+          "15m",
+          "1h",
+          "6h",
+          "12h",
+          "24h",
+          "2d",
+          "7d",
+          "30d"
+        ]
+      },
+      "timezone": "browser",
+      "title": "Kafka Exporter Overview",
+      "uid": "jwPKIsniz",
+      "version": 37
+    }
+  wal-writer-rust-monitoring.json: |
+    {
+        "annotations": {
+            "list": [
+                {
+                    "builtIn": 1,
+                    "datasource": {
+                        "type": "grafana",
+                        "uid": "-- Grafana --"
+                    },
+                    "enable": true,
+                    "hide": true,
+                    "iconColor": "rgba(0, 211, 255, 1)",
+                    "name": "Annotations & Alerts",
+                    "type": "dashboard"
+                }
+            ]
+        },
+        "editable": true,
+        "fiscalYearStartMonth": 0,
+        "graphTooltip": 0,
+        "id": null,
+        "links": [],
+        "liveNow": false,
+        "panels": [
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "thresholds"
+                        },
+                        "mappings": [
+                            {
+                                "options": {
+                                    "0": {
+                                        "color": "red",
+                                        "index": 0,
+                                        "text": "DOWN"
+                                    },
+                                    "1": {
+                                        "color": "green",
+                                        "index": 1,
+                                        "text": "UP"
+                                    }
+                                },
+                                "type": "value"
+                            }
+                        ],
+                        "max": 1,
+                        "min": 0,
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {
+                                    "color": "red",
+                                    "value": null
+                                },
+                                {
+                                    "color": "green",
+                                    "value": 1
+                                }
+                            ]
+                        }
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 5,
+                    "w": 4,
+                    "x": 0,
+                    "y": 0
+                },
+                "id": 1,
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "orientation": "auto",
+                    "reduceOptions": {
+                        "calcs": [
+                            "lastNotNull"
+                        ],
+                        "fields": "",
+                        "values": false
+                    },
+                    "textMode": "value_and_name"
+                },
+                "pluginVersion": "11.1.0",
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_ready",
+                        "legendFormat": "ready",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "Ready",
+                "type": "stat"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "thresholds"
+                        },
+                        "mappings": [
+                            {
+                                "options": {
+                                    "0": {
+                                        "color": "red",
+                                        "index": 0,
+                                        "text": "DISCONNECTED"
+                                    },
+                                    "1": {
+                                        "color": "green",
+                                        "index": 1,
+                                        "text": "CONNECTED"
+                                    }
+                                },
+                                "type": "value"
+                            }
+                        ],
+                        "max": 1,
+                        "min": 0,
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {
+                                    "color": "red",
+                                    "value": null
+                                },
+                                {
+                                    "color": "green",
+                                    "value": 1
+                                }
+                            ]
+                        }
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 5,
+                    "w": 5,
+                    "x": 4,
+                    "y": 0
+                },
+                "id": 2,
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "orientation": "auto",
+                    "reduceOptions": {
+                        "calcs": [
+                            "lastNotNull"
+                        ],
+                        "fields": "",
+                        "values": false
+                    },
+                    "textMode": "value_and_name"
+                },
+                "pluginVersion": "11.1.0",
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_replication_connected",
+                        "legendFormat": "replication",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "Replication Link",
+                "type": "stat"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "ops"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 5,
+                    "w": 7,
+                    "x": 9,
+                    "y": 0
+                },
+                "id": 3,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "sum by (operation) (rate(wal_writer_published_records_total[1m]))",
+                        "legendFormat": "{{operation}}",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "Publish Throughput by Operation (1m)",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 5,
+                    "w": 8,
+                    "x": 16,
+                    "y": 0
+                },
+                "id": 4,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "sum by (operation) (increase(wal_writer_publish_failures_total[5m]))",
+                        "legendFormat": "{{operation}}",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "Publish Failures by Operation (5m)",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 6,
+                    "w": 12,
+                    "x": 0,
+                    "y": 18
+                },
+                "id": 9,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_kafka_send_errors_total",
+                        "legendFormat": "send_errors",
+                        "range": true,
+                        "refId": "A"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_kafka_messages_sent_total",
+                        "legendFormat": "messages_sent",
+                        "range": true,
+                        "refId": "B"
+                    }
+                ],
+                "title": "Kafka Send Errors + Messages Sent",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "s"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 7,
+                    "w": 12,
+                    "x": 0,
+                    "y": 5
+                },
+                "id": 5,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "multi",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "histogram_quantile(0.50, sum by (le) (rate(wal_writer_publish_duration_seconds_bucket[5m])))",
+                        "legendFormat": "p50",
+                        "range": true,
+                        "refId": "A"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "histogram_quantile(0.95, sum by (le) (rate(wal_writer_publish_duration_seconds_bucket[5m])))",
+                        "legendFormat": "p95",
+                        "range": true,
+                        "refId": "B"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "histogram_quantile(0.99, sum by (le) (rate(wal_writer_publish_duration_seconds_bucket[5m])))",
+                        "legendFormat": "p99",
+                        "range": true,
+                        "refId": "C"
+                    }
+                ],
+                "title": "Kafka Publish Latency",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 7,
+                    "w": 12,
+                    "x": 12,
+                    "y": 5
+                },
+                "id": 6,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "table",
+                        "placement": "right",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "multi",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "sum by (type) (rate(wal_writer_wal_messages_total[1m]))",
+                        "legendFormat": "{{type}}",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "WAL Message Rate by Type",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 6,
+                    "w": 12,
+                    "x": 0,
+                    "y": 12
+                },
+                "id": 7,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_last_receive_lsn",
+                        "legendFormat": "last_receive_lsn",
+                        "range": true,
+                        "refId": "A"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_last_process_lsn",
+                        "legendFormat": "last_process_lsn",
+                        "range": true,
+                        "refId": "B"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_last_acked_lsn",
+                        "legendFormat": "last_acked_lsn",
+                        "range": true,
+                        "refId": "C"
+                    }
+                ],
+                "title": "LSN Progress",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 6,
+                    "w": 12,
+                    "x": 12,
+                    "y": 18
+                },
+                "id": 10,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "wal_writer_last_receive_lsn - wal_writer_last_acked_lsn",
+                        "legendFormat": "lsn_ack_gap",
+                        "range": true,
+                        "refId": "A"
+                    }
+                ],
+                "title": "LSN Ack Gap",
+                "type": "timeseries"
+            },
+            {
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {
+                            "mode": "palette-classic"
+                        },
+                        "unit": "short"
+                    },
+                    "overrides": []
+                },
+                "gridPos": {
+                    "h": 6,
+                    "w": 12,
+                    "x": 12,
+                    "y": 12
+                },
+                "id": 8,
+                "options": {
+                    "legend": {
+                        "calcs": [],
+                        "displayMode": "list",
+                        "placement": "bottom",
+                        "showLegend": true
+                    },
+                    "tooltip": {
+                        "mode": "single",
+                        "sort": "none"
+                    }
+                },
+                "targets": [
+                    {
+                        "editorMode": "code",
+                        "expr": "increase(wal_writer_replication_loop_exits_total[1h])",
+                        "legendFormat": "replication_loop_exits",
+                        "range": true,
+                        "refId": "A"
+                    },
+                    {
+                        "editorMode": "code",
+                        "expr": "increase(wal_writer_process_wal_errors_total[1h])",
+                        "legendFormat": "process_wal_errors",
+                        "range": true,
+                        "refId": "B"
+                    }
+                ],
+                "title": "Errors/Restarts (1h Increase)",
+                "type": "timeseries"
+            }
+        ],
+        "refresh": "10s",
+        "schemaVersion": 39,
+        "tags": [
+            "wal-writer",
+            "cdc",
+            "kafka",
+            "postgres"
+        ],
+        "templating": {
+            "list": [
+                {
+                    "current": {
+                        "selected": false,
+                        "text": "Prometheus",
+                        "value": "Prometheus"
+                    },
+                    "hide": 0,
+                    "includeAll": false,
+                    "label": "datasource",
+                    "multi": false,
+                    "name": "DS_PROMETHEUS",
+                    "options": [],
+                    "query": "prometheus",
+                    "refresh": 1,
+                    "regex": "",
+                    "skipUrlSync": false,
+                    "type": "datasource"
+                }
+            ]
+        },
+        "time": {
+            "from": "now-15m",
+            "to": "now"
+        },
+        "timepicker": {},
+        "timezone": "",
+        "title": "WAL Writer Rust Monitoring",
+        "uid": "wal-writer-rust-monitor",
+        "version": 1,
+        "weekStart": ""
+    }

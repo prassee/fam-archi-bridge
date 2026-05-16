@@ -316,6 +316,19 @@ k8s-rebuild-wal-writer-image:
     kind load docker-image wal-writer-rust:latest --name matte
     @echo "WAL Writer image rebuilt and loaded into kind"
 
+# Rebuild data-pump-go image and load it into kind cluster 'matte'
+k8s-rebuild-data-pump-image:
+    docker build -f data_pump_go/Dockerfile -t data-pump-go:latest data_pump_go/
+    kind load docker-image data-pump-go:latest --name matte
+    @echo "Data Pump Go image rebuilt and loaded into kind"
+
+# Roll out data-pump-go deployment with latest manifest and image
+k8s-rollout-data-pump:
+    kubectl apply -f k8s/data-pump-go.yaml
+    kubectl rollout restart deployment/data-pump-go -n cdc
+    kubectl rollout status deployment/data-pump-go -n cdc
+    @echo "Data Pump Go rolled out"
+
 # Roll out wal-writer deployment with latest manifest and image
 k8s-rollout-wal-writer:
     kubectl apply -f k8s/configmap.yaml

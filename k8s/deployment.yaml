@@ -95,6 +95,11 @@ spec:
             configMapKeyRef:
               name: wal-writer-config
               key: WAL_WRITER_KAFKA_BATCH_SIZE
+        - name: WAL_WRITER_KAFKA_QUEUE_BUFFERING_MAX_MS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_KAFKA_QUEUE_BUFFERING_MAX_MS
         - name: WAL_WRITER_PUBLICATION
           valueFrom:
             configMapKeyRef:
@@ -135,6 +140,16 @@ spec:
             configMapKeyRef:
               name: wal-writer-config
               key: WAL_WRITER_DEBUG_PRINT_WAL
+        - name: WAL_WRITER_STATE_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_STATE_DIR
+        - name: WAL_WRITER_STATE_PERSIST_INTERVAL_SECS
+          valueFrom:
+            configMapKeyRef:
+              name: wal-writer-config
+              key: WAL_WRITER_STATE_PERSIST_INTERVAL_SECS
         ports:
         - containerPort: 9090
           name: metrics
@@ -160,10 +175,15 @@ spec:
         volumeMounts:
         - name: logs
           mountPath: /var/log/wal-writer
+        - name: state
+          mountPath: /var/run/wal-writer/state
       volumes:
       - name: logs
         emptyDir:
           sizeLimit: 1Gi
+      - name: state
+        emptyDir:
+          sizeLimit: 100Mi
       securityContext:
         runAsNonRoot: false
         runAsUser: 0

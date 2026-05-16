@@ -344,6 +344,16 @@ impl WalReader {
                         reply_requested,
                         batch_queue.count().await
                     );
+
+                    // CRITICAL FIX: Send status response when PostgreSQL requests it
+                    // This allows PostgreSQL to advance replication slot confirmed_flush_lsn
+                    if reply_requested {
+                        client.update_applied_lsn(Lsn(confirmed_lsn));
+                        debug!(
+                            "Sent keepalive status response to PostgreSQL (confirmed_lsn={})",
+                            format!("{}/{}", confirmed_lsn >> 32, confirmed_lsn & 0xFFFFFFFF)
+                        );
+                    }
                 }
                 Some(ReplicationEvent::Message {
                     transactional: _,
