@@ -1,0 +1,16 @@
+# WAL Consumer Configuration
+# Topics to subscribe to and consume CDC messages from
+
+[kafka]
+brokers = "kafka:9092"
+group = "wal-consumer"
+channel_capacity = 1000
+
+# CDC topics to subscribe to
+# These should match the topics being published by wal-writer
+topics = [
+    "cdc.public.upi_transactions",
+    "cdc.public.users",
+    "cdc.public.subscriptions",
+    "cdc.public.offers"
+]

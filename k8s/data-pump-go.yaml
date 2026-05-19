@@ -32,7 +32,7 @@ spec:
         - name: DB_NAME
           value: postgres
         - name: DATA_PUMP_TARGET_PER_SEC
-          value: "7500"
+          value: "9900"
         - name: DATA_PUMP_BATCH_SIZE
           value: "500"
         - name: DATA_PUMP_USERS_BATCH_SIZE

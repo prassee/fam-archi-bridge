@@ -6,6 +6,7 @@ resources:
   - rbac.yaml
   - configmap.yaml
   - postgres.yaml
+  - postgres-polaris.yaml
   - kafka.yaml
   - db-init.yaml
   - deployment.yaml
@@ -15,6 +16,8 @@ resources:
   - loki.yaml
   - promtail.yaml
   - storage.yaml
+  - minio.yaml
+  - polaris.yaml
 
 labels:
   - pairs:

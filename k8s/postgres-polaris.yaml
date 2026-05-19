@@ -1,0 +1,109 @@
+---
+# ─────────────────────────────────────────────────────────────
+# Dedicated PostgreSQL for Polaris Catalog
+# Separate from CDC source database to avoid bootstrap conflicts
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-polaris-pvc
+  namespace: cdc
+  labels:
+    app: postgres-polaris
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-polaris
+  namespace: cdc
+  labels:
+    app: postgres-polaris
+spec:
+  serviceName: postgres-polaris
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-polaris
+  template:
+    metadata:
+      labels:
+        app: postgres-polaris
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5432"
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5432
+          name: postgresql
+        env:
+        - name: POSTGRES_DB
+          value: postgres
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U postgres
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-polaris-pvc
+
+---
+# ─────────────────────────────────────────────────────────────
+# Service for Polaris PostgreSQL
+# Internal DNS: postgres-polaris.cdc.svc.cluster.local:5432
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-polaris
+  namespace: cdc
+  labels:
+    app: postgres-polaris
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgresql
+  selector:
+    app: postgres-polaris

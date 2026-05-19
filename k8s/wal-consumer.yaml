@@ -23,22 +23,30 @@ spec:
         image: wal-consumer:latest
         imagePullPolicy: IfNotPresent
         env:
-        - name: WAL_WRITER_KAFKA_BROKERS
-          value: kafka.cdc.svc.cluster.local:9092
-        - name: WAL_WRITER_KAFKA_TOPIC_PREFIX
-          valueFrom:
-            configMapKeyRef:
-              name: wal-writer-config
-              key: WAL_WRITER_KAFKA_TOPIC_PREFIX
-              optional: true
-        - name: WAL_CONSUMER_GROUP_ID
-          value: wal-consumer-console
-        - name: WAL_CONSUMER_WORKERS
-          value: "8"
-        - name: WAL_CONSUMER_COMMIT_EVERY
-          value: "5000"
+        - name: WAL_CONSUMER_CONFIG
+          value: /etc/wal-consumer/wal_consumer_config.toml
         - name: RUST_LOG
           value: info
+        volumeMounts:
+        - name: config
+          mountPath: /etc/wal-consumer
+          readOnly: true
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+      volumes:
+      - name: config
+        configMap:
+          name: wal-consumer-config
+          items:
+          - key: wal_consumer_config.toml
+            path: wal_consumer_config.toml
+        - name: WAL_CONSUMER_PG_DATABASE
+          value: postgres
         resources:
           requests:
             cpu: 100m

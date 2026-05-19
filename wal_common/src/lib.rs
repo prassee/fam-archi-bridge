@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub state: StateConfig,
     pub pending_batch_queue_size: usize,
+    pub iceberg: Option<IcebergConfig>,
 }
 
 impl AppConfig {
@@ -105,6 +106,7 @@ impl AppConfig {
                     .unwrap_or(60),
             },
             pending_batch_queue_size,
+            iceberg: IcebergConfig::from_env().ok(),
         })
     }
 }
@@ -201,5 +203,47 @@ impl Default for StateConfig {
             directory: None,
             persist_interval_secs: 60,
         }
+    }
+}
+
+/// Iceberg catalog configuration (for Phase 3 consumer)
+#[derive(Clone, Debug, Deserialize)]
+pub struct IcebergConfig {
+    pub polaris_endpoint: String,
+    pub polaris_realm: String,
+    pub polaris_catalog: String,
+    pub pg_host: String,
+    pub pg_port: u16,
+    pub pg_user: String,
+    pub pg_password: String,
+    pub pg_database: String,
+}
+
+impl IcebergConfig {
+    pub fn from_env() -> Result<Self, env::VarError> {
+        Ok(Self {
+            polaris_endpoint: env::var("WAL_CONSUMER_POLARIS_ENDPOINT")
+                .unwrap_or_else(|_| "http://polaris:8181".to_string()),
+            polaris_realm: env::var("WAL_CONSUMER_POLARIS_REALM")
+                .unwrap_or_else(|_| "POLARIS".to_string()),
+            polaris_catalog: env::var("WAL_CONSUMER_POLARIS_CATALOG")
+                .unwrap_or_else(|_| "quickstart_catalog".to_string()),
+            pg_host: env::var("WAL_CONSUMER_PG_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            pg_port: env::var("WAL_CONSUMER_PG_PORT")
+                .unwrap_or_else(|_| "5432".to_string())
+                .parse()
+                .unwrap_or(5432),
+            pg_user: env::var("WAL_CONSUMER_PG_USER").unwrap_or_else(|_| "postgres".to_string()),
+            pg_password: env::var("WAL_CONSUMER_PG_PASSWORD").unwrap_or_else(|_| "".to_string()),
+            pg_database: env::var("WAL_CONSUMER_PG_DATABASE")
+                .unwrap_or_else(|_| "postgres".to_string()),
+        })
+    }
+
+    pub fn pg_connection_string(&self) -> String {
+        format!(
+            "host={} port={} user={} password={} dbname={}",
+            self.pg_host, self.pg_port, self.pg_user, self.pg_password, self.pg_database
+        )
     }
 }

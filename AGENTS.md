@@ -125,6 +125,179 @@ If you want I can implement these steps in order. Stopping now as requested.
 
 ## Kafka Batching (Current Rust Implementation)
 
+### Message Contract Specification
+
+#### Phase 2 → Phase 3 CDC Message Format (WAL Writer → WAL Consumer)
+
+The **wal-writer** produces CDC events as JSON messages published to Kafka topics following the naming pattern: `{topic_prefix}.{schema}.{table}` (default prefix: `cdc.public.*`).
+
+**Message Schema:**
+
+```json
+{
+  "lsn": 18446744073709551615,
+  "table_schema": "public",
+  "table_name": "upi_transactions",
+  "operation": "INSERT",
+  "oid": 16385,
+  "new_tuple": {
+    "columns": [
+      {
+        "name": "transaction_id",
+        "type_oid": 20,
+        "value": "12345",
+        "is_null": false
+      },
+      {
+        "name": "user_id",
+        "type_oid": 23,
+        "value": 5678,
+        "is_null": false
+      },
+      {
+        "name": "amount",
+        "type_oid": 1700,
+        "value": "500.50",
+        "is_null": false
+      },
+      {
+        "name": "status",
+        "type_oid": 25,
+        "value": "SUCCESS",
+        "is_null": false
+      }
+    ]
+  },
+  "old_tuple": null,
+  "tx_commit_time": 1715950000000000,
+  "tx_xid": 1234567
+}
+```
+
+**Field Definitions:**
+
+| Field | Type | Description | Examples |
+|-------|------|-------------|----------|
+| `lsn` | u64 | PostgreSQL Logical Sequence Number (WAL offset). Monotonically increasing identifier for ordering. Used for deduplication and exactly-once guarantees. | `0/12345678`, `1/87654321` |
+| `table_schema` | string | PostgreSQL schema name | `"public"`, `"payments"` |
+| `table_name` | string | PostgreSQL table name | `"upi_transactions"`, `"users"` |
+| `operation` | string | DML operation type. One of: `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` | `"INSERT"` |
+| `oid` | u32 | PostgreSQL object ID (relation OID) for the table | `16385` |
+| `new_tuple` | object\|null | **Tuple containing new row values.** Present for: INSERT (all columns), UPDATE (all columns). Null for DELETE, TRUNCATE. | See structure below |
+| `old_tuple` | object\|null | **Tuple containing old row values.** Present for: UPDATE (all columns), DELETE (columns with replica identity). Null for INSERT, TRUNCATE. Note: DELETE may have partial tuple if replica identity is CHANGE (not all columns). | See structure below |
+| `tx_commit_time` | i64 | PostgreSQL transaction commit timestamp (microseconds since epoch). | `1715950000000000` |
+| `tx_xid` | u64 | PostgreSQL transaction ID (xid) for grouping related changes | `1234567` |
+
+**Tuple Structure (new_tuple / old_tuple):**
+
+```json
+{
+  "columns": [
+    {
+      "name": "column_name",
+      "type_oid": 25,
+      "value": "string_value",
+      "is_null": false
+    },
+    {
+      "name": "numeric_col",
+      "type_oid": 20,
+      "value": 12345,
+      "is_null": false
+    },
+    {
+      "name": "nullable_col",
+      "type_oid": 1114,
+      "value": null,
+      "is_null": true
+    }
+  ]
+}
+```
+
+**Column Field Definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Column name from table definition |
+| `type_oid` | u32 | PostgreSQL type OID (OID 20=bigint, 23=int, 25=text, 1700=numeric, 1114=timestamp, 16=boolean, etc.) |
+| `value` | string\|integer\|float\|boolean\|null | Actual column value. Type depends on PostgreSQL column type. Null when `is_null=true`. String values are UTF-8 encoded. |
+| `is_null` | boolean | True if column is NULL, false otherwise |
+
+**Operation Type Semantics:**
+
+| Operation | new_tuple | old_tuple | Semantics |
+|-----------|-----------|-----------|-----------|
+| **INSERT** | All columns | null | New row inserted; all columns in new_tuple |
+| **UPDATE** | All columns | All columns (replica identity) | Row modified; new and old values for merge/conflict detection |
+| **DELETE** | null | Partial or full (replica identity) | Row deleted; old_tuple contains only replica identity columns (DEFAULT) or all columns (FULL) or none (NOTHING) |
+| **TRUNCATE** | null | null | Entire table truncated; no row-level data |
+
+**Delivery Guarantees:**
+
+| Guarantee | Description |
+|-----------|-------------|
+| **At-Most-Once per LSN** | Each unique LSN is published exactly once to Kafka. LSN is only ACK'd to PostgreSQL after Kafka publish succeeds. |
+| **Ordering per Table** | Messages for the same table (`schema.table`) arrive in LSN order (guaranteed by single replication slot, per-table topics). |
+| **No Ordering Across Tables** | Messages for different tables may arrive out of LSN order due to parallel publishers (by design for throughput). |
+| **Exactly-Once Processing** | Consumers must use `(lsn, table_schema, table_name)` as deduplication key to handle retries. |
+
+**Kafka Topic Routing:**
+
+```
+Topic Pattern: {prefix}.{schema}.{table}
+Example: cdc.public.upi_transactions
+         cdc.public.users
+         cdc.public.subscriptions
+```
+
+- Each table gets its own topic for partition-level parallelism
+- Topic auto-creation enabled in Kafka cluster
+- Partition key: `tx_xid.to_string()` (groups rows from same transaction)
+
+**Message Serialization:**
+
+- **Format**: JSON (UTF-8)
+- **Serializer**: `serde_json::to_string(&WalRecord)` (Rust struct → JSON)
+- **Size**: Typical 500B-5KB per message (varies with column count)
+- **Compression**: Optional (snappy/lz4 at Kafka broker level, not in message)
+
+**Consumer Parsing Example:**
+
+```python
+# Python consumer example
+import json
+from confluent_kafka import Consumer
+
+consumer = Consumer({'bootstrap.servers': 'kafka:9092', 'group.id': 'consumers'})
+consumer.subscribe(['cdc.public.users'])
+
+while True:
+    msg = consumer.poll(1.0)
+    if msg is None:
+        continue
+    
+    cdc_event = json.loads(msg.value().decode('utf-8'))
+    
+    operation = cdc_event['operation']
+    schema = cdc_event['table_schema']
+    table = cdc_event['table_name']
+    lsn = cdc_event['lsn']
+    
+    if operation == 'INSERT':
+        rows = cdc_event['new_tuple']['columns']
+        # Insert into target system
+    elif operation == 'UPDATE':
+        # Use lsn + tx_xid as merge key
+        # Merge old_tuple + new_tuple for upsert
+        pass
+    elif operation == 'DELETE':
+        # Use replica identity (old_tuple) to find & delete rows
+        pass
+```
+
+---
+
 The active runtime path in this repository is the Rust writer (`wal_writer/`) running as `wal-writer-rust` in Docker Compose.
 
 Current batching flow:

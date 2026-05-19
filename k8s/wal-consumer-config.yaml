@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wal-consumer-config
+  namespace: cdc
+data:
+  wal_consumer_config.toml: |
+    # WAL Consumer Configuration
+
+    [kafka]
+    brokers = "kafka.cdc.svc.cluster.local:9092"
+    group = "wal-consumer"
+    channel_capacity = 1000
+
+    # CDC topics to subscribe to
+    topics = [
+        "cdc.public.upi_transactions",
+        "cdc.public.users",
+        "cdc.public.subscriptions",
+        "cdc.public.offers"
+    ]
