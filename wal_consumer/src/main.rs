@@ -267,64 +267,78 @@ async fn main() -> Result<()> {
     let mut last_stats_time = std::time::Instant::now();
     let mut total_messages = 0u64;
 
-    // Consume messages and route to topic channels
+    // Consume messages and route to topic channels.
+    // The consume loop runs until the process receives a shutdown signal.
     loop {
-        match consumer.recv().await {
-            Err(e) => {
-                error!("Kafka consumer error: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received — stopping consumer loop");
+                break;
             }
-            Ok(msg) => {
-                let topic = msg.topic();
-                let partition = msg.partition();
-                let offset = msg.offset();
+            recv_result = consumer.recv() => match recv_result {
+                Err(e) => {
+                    error!("Kafka consumer error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Ok(msg) => {
+                    let topic = msg.topic();
+                    let partition = msg.partition();
+                    let offset = msg.offset();
 
-                if let Some(payload) = msg.payload() {
-                    total_messages += 1;
+                    if let Some(payload) = msg.payload() {
+                        total_messages += 1;
 
-                    // Route to topic handler
-                    if let Some(tx) = senders.get(topic) {
-                        if let Err(e) = tx.try_send(payload.to_vec()) {
+                        // Route to topic handler.
+                        // Use blocking send for backpressure: if the handler is behind
+                        // we must not commit the offset until the payload is accepted.
+                        let routed = if let Some(tx) = senders.get(topic) {
+                            tx.send(payload.to_vec()).await.is_ok()
+                        } else {
+                            warn!(
+                                topic = topic,
+                                "Message received for unknown topic (not subscribed)"
+                            );
+                            true // treat as handled so we still commit
+                        };
+
+                        // Commit only after the payload is accepted by the handler channel,
+                        // preventing at-most-once delivery on channel-full drops.
+                        if routed {
+                            if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
+                                warn!(
+                                    topic = topic,
+                                    partition = partition,
+                                    offset = offset,
+                                    "Failed to commit offset: {}",
+                                    e
+                                );
+                            }
+                        } else {
                             error!(
                                 topic = topic,
                                 partition = partition,
                                 offset = offset,
-                                "Failed to send message to topic handler: {}",
-                                e
+                                "Handler channel closed — not committing offset"
                             );
                         }
-                    } else {
-                        warn!(
-                            topic = topic,
-                            "Message received for unknown topic (not subscribed)"
-                        );
                     }
 
-                    // Commit offset
-                    if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
-                        warn!(
-                            topic = topic,
-                            partition = partition,
-                            offset = offset,
-                            "Failed to commit offset: {}",
-                            e
+                    // Log stats every 30 seconds
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_stats_time) > Duration::from_secs(30) {
+                        let elapsed = now.duration_since(last_stats_time).as_secs_f64();
+                        let rate = total_messages as f64 / elapsed;
+                        info!(
+                            total_messages = total_messages,
+                            rate_msg_per_sec = format!("{:.1}", rate),
+                            "Consumer throughput"
                         );
+                        last_stats_time = now;
                     }
-                }
-
-                // Log stats every 30 seconds
-                let now = std::time::Instant::now();
-                if now.duration_since(last_stats_time) > Duration::from_secs(30) {
-                    let elapsed = now.duration_since(last_stats_time).as_secs_f64();
-                    let rate = total_messages as f64 / elapsed;
-                    info!(
-                        total_messages = total_messages,
-                        rate_msg_per_sec = format!("{:.1}", rate),
-                        "Consumer throughput"
-                    );
-                    last_stats_time = now;
                 }
             }
         }
     }
+
+    Ok(())
 }

@@ -1,10 +1,14 @@
 #![allow(dead_code)]
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
+use tokio::signal;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 use wal_common::AppConfig;
@@ -24,6 +28,7 @@ pub struct WalReader {
     metrics: Metrics,
     batch_queue_router: BatchQueueRouter,
     batch_config: BatchConfig,
+    kafka_producer: Arc<KafkaProducer>,
 }
 
 fn hex_encode(data: &[u8]) -> String {
@@ -63,7 +68,6 @@ impl WalReader {
         let batch_queue_router =
             BatchQueueRouter::new(config.kafka.num_publishers, config.pending_batch_queue_size);
 
-        // Read batch config from AppConfig
         let batch_config = BatchConfig {
             max_records_per_batch: config.replication.batch_size as usize,
             flush_interval_ms: config.replication.poll_interval_ms as u64,
@@ -71,18 +75,18 @@ impl WalReader {
 
         Self {
             config,
-            decoder: WalDecoder::new(kafka_producer, metrics.clone()),
+            decoder: WalDecoder::new(kafka_producer.clone(), metrics.clone()),
             lsn_tracker,
             metrics,
             batch_queue_router,
             batch_config,
+            kafka_producer,
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting WAL reader in replication mode");
 
-        // Load persisted LSN state
         if let Err(e) = self.lsn_tracker.load().await {
             warn!("Failed to load LSN state: {}", e);
         }
@@ -107,7 +111,6 @@ impl WalReader {
             None => 0,
         };
 
-        // Build replication client config
         let cfg = ReplicationConfig {
             host: self.config.pg.host.clone(),
             port: self.config.pg.port,
@@ -132,24 +135,29 @@ impl WalReader {
         let metrics = self.metrics.clone();
         let batch_queue_router = self.batch_queue_router.clone();
 
-        let mut _total_wal_bytes: u64 = 0;
-        let mut _total_records_parsed: u64 = 0;
-        let mut _total_batches_sent: u64 = 0;
         let mut total_parse_errors: u64 = 0;
-        let mut _last_log = Instant::now();
         let mut confirmed_lsn: u64 = 0;
-        const LOG_INTERVAL_SECS: u64 = 10;
+
+        // Fence-based LSN tracking: wal_end → number of pending batches.
+        // confirmed_lsn advances only when the LOWEST fence clears, ensuring that
+        // no parallel publisher can race ahead and cause WAL recycling before all
+        // batches from a given WAL position are delivered.
+        let mut pending_fences: BTreeMap<u64, usize> = BTreeMap::new();
+
+        // ACK channel: publishers send the wal_end of each successfully published batch.
         let (ack_sender, mut ack_receiver) = mpsc::unbounded_channel::<u64>();
 
-        info!("WAL reader loop started — waiting for replication events");
+        // Graceful-shutdown flag shared with every publisher task.
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Spawn multiple parallel batch publisher tasks
+        // Spawn publishers and keep handles so we can drain them on shutdown.
         let num_publishers = self.config.kafka.num_publishers;
         info!(
             "Spawning {} parallel batch publisher task(s) with per-topic affinity",
             num_publishers
         );
 
+        let mut publisher_handles: Vec<JoinHandle<()>> = Vec::with_capacity(num_publishers);
         for publisher_id in 0..num_publishers {
             let publisher_decoder = decoder.clone();
             let publisher_batch_queue = batch_queue_router.get_queue(publisher_id);
@@ -158,10 +166,12 @@ impl WalReader {
             let publisher_slot_name = slot_name.clone();
             let publisher_batch_config = self.batch_config.clone();
             let publisher_ack_sender = ack_sender.clone();
+            let publisher_shutdown = shutdown.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 info!("Publisher task {} started", publisher_id);
-                batch_publisher_loop(
+                if let Err(e) = batch_publisher_loop(
+                    publisher_id,
                     publisher_decoder,
                     publisher_batch_queue,
                     publisher_lsn_tracker,
@@ -169,28 +179,57 @@ impl WalReader {
                     publisher_slot_name,
                     publisher_batch_config,
                     publisher_ack_sender,
+                    publisher_shutdown,
                 )
                 .await
+                {
+                    error!("Publisher {} exited with error: {}", publisher_id, e);
+                }
             });
+            publisher_handles.push(handle);
         }
 
-        // Receive replication events
-        loop {
-            tokio::select! {
-                maybe_acked_lsn = ack_receiver.recv() => {
-                    if let Some(acked_lsn) = maybe_acked_lsn {
-                        confirmed_lsn = confirmed_lsn.max(acked_lsn);
-                        client.update_applied_lsn(Lsn(confirmed_lsn));
-                        metrics.set_last_acked_lsn(confirmed_lsn);
+        info!("WAL reader loop started — waiting for replication events");
 
-                        debug!(
-                            "Advanced replication applied LSN to {}",
-                            format!("{}/{}", confirmed_lsn >> 32, confirmed_lsn & 0xFFFFFFFF)
-                        );
+        'replication: loop {
+            tokio::select! {
+                // Shutdown signal: break out and drain
+                _ = signal::ctrl_c() => {
+                    info!("Shutdown signal received — draining pending batches");
+                    break 'replication;
+                }
+
+                // ACK from publisher: decrement fence and possibly advance confirmed_lsn
+                maybe_acked_wal_end = ack_receiver.recv() => {
+                    if let Some(acked_wal_end) = maybe_acked_wal_end {
+                        if let Some(count) = pending_fences.get_mut(&acked_wal_end) {
+                            *count = count.saturating_sub(1);
+                        }
+                        // Sweep cleared fences from the front (smallest wal_end first).
+                        // We can only advance confirmed_lsn once lower fences are clear.
+                        loop {
+                            match pending_fences.first_key_value() {
+                                Some((&wal_end, &0)) => {
+                                    pending_fences.pop_first();
+                                    confirmed_lsn = wal_end;
+                                    client.update_applied_lsn(Lsn(confirmed_lsn));
+                                    metrics.set_last_acked_lsn(confirmed_lsn);
+                                    let lsn_str = format!(
+                                        "{}/{}",
+                                        confirmed_lsn >> 32,
+                                        confirmed_lsn & 0xFFFFFFFF
+                                    );
+                                    let _ = lsn_tracker.persist(&slot_name, &lsn_str).await;
+                                    debug!("Advanced confirmed_lsn to {}", lsn_str);
+                                }
+                                _ => break,
+                            }
+                        }
                     } else {
-                        warn!("Batch publisher acknowledgment channel closed");
+                        warn!("ACK channel closed unexpectedly");
                     }
                 }
+
                 replication_event = client.recv() => match replication_event
                     .context("Failed to receive replication event")?
                 {
@@ -201,7 +240,6 @@ impl WalReader {
                     server_time_micros: _,
                 }) => {
                     let bytes = data.len() as u64;
-                    _total_wal_bytes += bytes;
                     debug!(
                         "Received XLogData {} bytes at LSN {}",
                         bytes,
@@ -231,7 +269,7 @@ impl WalReader {
                                 metrics.process_wal_errors_inc();
                             }
                         }
-                        continue;
+                        continue 'replication;
                     }
 
                     match parser.parse(&data) {
@@ -244,26 +282,27 @@ impl WalReader {
 
                             let n = records.len();
                             metrics.wal_records_parsed_inc(n as u64);
+
                             if !records.is_empty() {
-                                _total_records_parsed += n as u64;
-                                debug!(
-                                    "Parsed {} WAL record(s) from {} bytes at LSN {}",
-                                    n,
-                                    bytes,
-                                    wal_end.as_u64()
-                                );
-
-                                // Stage 1: Buffer records into pending batch queue
-                                // Do NOT acknowledge LSN yet
-                                let mut by_table: std::collections::HashMap<(String, String), Vec<WalRecord>> =
-                                    std::collections::HashMap::new();
-
+                                // Group by (schema, table) for per-topic routing.
+                                let mut by_table: HashMap<(String, String), Vec<WalRecord>> =
+                                    HashMap::new();
                                 for record in records {
                                     let key = (record.table_schema.clone(), record.table_name.clone());
-                                    by_table
-                                        .entry(key)
-                                        .or_insert_with(Vec::new)
-                                        .push(record.clone());
+                                    by_table.entry(key).or_default().push(record);
+                                }
+
+                                // Count total batches that will be created for this wal_end
+                                // BEFORE enqueueing, so the fence is in place before any ACK
+                                // can arrive from a publisher.
+                                let max_per_batch = self.batch_config.max_records_per_batch;
+                                let mut total_batches = 0usize;
+                                for table_records in by_table.values() {
+                                    let chunks = (table_records.len() + max_per_batch - 1) / max_per_batch;
+                                    total_batches += chunks;
+                                }
+                                if total_batches > 0 {
+                                    *pending_fences.entry(wal_end.as_u64()).or_insert(0) += total_batches;
                                 }
 
                                 for ((_schema, _table), table_records) in by_table {
@@ -271,13 +310,18 @@ impl WalReader {
                                         continue;
                                     }
 
-                                    let topic = format!("{}.{}.{}", decoder.kafka_topic_prefix(), _schema, _table);
+                                    let topic = format!(
+                                        "{}.{}.{}",
+                                        decoder.kafka_topic_prefix(),
+                                        _schema,
+                                        _table
+                                    );
 
-                                    // Split records into properly-sized batches
                                     let batches = split_into_batches(
                                         &topic,
                                         table_records,
-                                        self.batch_config.max_records_per_batch,
+                                        max_per_batch,
+                                        wal_end.as_u64(),
                                     );
 
                                     for batch in batches {
@@ -289,25 +333,18 @@ impl WalReader {
                                         if wait_iterations > 0 {
                                             let waited_ms = wait_iterations * 5;
                                             warn!(
-                                                "Applied backpressure while queueing batch for topic='{}' table='{}.{}': waited {} ms (pending={})",
+                                                "Backpressure on topic='{}' table='{}.{}': waited {}ms (pending={})",
                                                 topic,
                                                 _schema,
                                                 _table,
                                                 waited_ms,
-                                                batch_queue_router.total_count().await
+                                                batch_queue_router.total_count()
                                             );
-                                        } else {
-                                            debug!("Batch queued for Kafka publish (pending={})", batch_queue_router.total_count().await);
                                         }
                                     }
                                 }
 
-                                debug!("Buffered {} records into pending batches", n);
-                            } else {
-                                debug!(
-                                    "XLogData {} bytes yielded 0 records (non-DML message)",
-                                    bytes
-                                );
+                                debug!("Buffered {} WAL records into pending batches (wal_end={}, pending_fences={})", n, wal_end.as_u64(), pending_fences.len());
                             }
                         }
                         Err(e) => {
@@ -336,10 +373,11 @@ impl WalReader {
                 }) => {
                     metrics.inc_wal_message("commit");
                     debug!(
-                        "Commit at LSN {} (end LSN {}) — pending batch queue size={}",
+                        "Commit at LSN {} (end LSN {}) — pending_fences={} pending_batches={}",
                         lsn.as_u64(),
                         end_lsn.as_u64(),
-                        batch_queue_router.total_count().await
+                        pending_fences.len(),
+                        batch_queue_router.total_count()
                     );
                 }
                 Some(ReplicationEvent::KeepAlive {
@@ -352,17 +390,11 @@ impl WalReader {
                         "Keepalive at {} reply_requested={} pending_batches={}",
                         wal_end.as_u64(),
                         reply_requested,
-                        batch_queue_router.total_count().await
+                        batch_queue_router.total_count()
                     );
-
-                    // CRITICAL FIX: Send status response when PostgreSQL requests it
-                    // This allows PostgreSQL to advance replication slot confirmed_flush_lsn
+                    // Respond when PostgreSQL requests it so confirmed_flush_lsn advances.
                     if reply_requested {
                         client.update_applied_lsn(Lsn(confirmed_lsn));
-                        debug!(
-                            "Sent keepalive status response to PostgreSQL (confirmed_lsn={})",
-                            format!("{}/{}", confirmed_lsn >> 32, confirmed_lsn & 0xFFFFFFFF)
-                        );
                     }
                 }
                 Some(ReplicationEvent::Message {
@@ -373,7 +405,7 @@ impl WalReader {
                 }) => {
                     metrics.inc_wal_message("message");
                     debug!(
-                        "Logical message {} at {} prefix={}",
+                        "Logical message {} bytes at {} prefix={}",
                         content.len(),
                         lsn.as_u64(),
                         prefix
@@ -382,18 +414,41 @@ impl WalReader {
                 Some(ReplicationEvent::StoppedAt { reached }) => {
                     metrics.inc_wal_message("stopped");
                     info!("Replication stopped at {}", reached.as_u64());
-                    break;
+                    break 'replication;
                 }
                 None => {
                     info!("Replication event stream closed");
-                    break;
+                    break 'replication;
                 }
                 }
             }
         }
 
         metrics.inc_replication_loop_exits();
-        info!("Shutting down WAL reader");
+        info!(
+            "Replication loop exited — signalling {} publisher(s) to drain and stop",
+            publisher_handles.len()
+        );
+
+        // Signal publishers: finish their in-flight work then exit.
+        shutdown.store(true, Ordering::Release);
+        // Drop our copy of ack_sender so publishers can still drain; the receiver
+        // is local and drops at end of this fn anyway.
+        drop(ack_sender);
+
+        for (i, handle) in publisher_handles.into_iter().enumerate() {
+            if let Err(e) = handle.await {
+                warn!("Publisher {} did not finish cleanly: {:?}", i, e);
+            }
+        }
+        info!("All publishers drained");
+
+        // Flush rdkafka's internal send queue (in-flight network I/O).
+        if let Err(e) = self.kafka_producer.flush(Duration::from_secs(5)) {
+            warn!("Kafka flush during shutdown returned error: {}", e);
+        }
+
+        info!("WAL reader shutdown complete");
         Ok(())
     }
 
@@ -432,40 +487,40 @@ impl WalReader {
     }
 }
 
-/// Split records into appropriately-sized batches based on max_records_per_batch
-/// Returns Vec of PendingBatch, each with at most max_records_per_batch records
+/// Split records into appropriately-sized batches.
+/// `wal_end` is the WAL position of the XLogData message these records came from — stored on
+/// each batch for fence-based LSN tracking in the replication loop.
 fn split_into_batches(
     topic: &str,
     records: Vec<WalRecord>,
     max_records_per_batch: usize,
+    wal_end: u64,
 ) -> Vec<PendingBatch> {
     if records.is_empty() {
         return Vec::new();
     }
 
-    let mut batches = Vec::new();
-
-    for chunk in records.chunks(max_records_per_batch) {
-        let lsns: Vec<u64> = chunk.iter().map(|r| r.lsn).collect();
-        let max_lsn = lsns.iter().copied().max().unwrap_or(0);
-
-        batches.push(PendingBatch {
+    records
+        .chunks(max_records_per_batch)
+        .map(|chunk| PendingBatch {
             records: chunk.to_vec(),
-            lsns,
-            max_lsn,
+            wal_end,
             created_at: Instant::now(),
             topic: topic.to_string(),
-        });
-    }
-
-    batches
+        })
+        .collect()
 }
 
-/// Background task: publishes buffered batches to Kafka and acknowledges LSNs
-/// Stage 2 & 3 of batch-based write:
-///   - Stage 2: Publish batch to Kafka with retry logic
-///   - Stage 3: On success, acknowledge all LSNs in batch (ONLY after Kafka confirms)
+/// Background task: publishes buffered batches to Kafka then ACKs their wal_ends.
+///
+/// Lifecycle:
+///   1. Dequeue batches and micro-batch same-topic contiguous entries.
+///   2. Publish combined batch to Kafka with retry.
+///   3. On success: send one ACK per distinct wal_end covered by this publish.
+///   4. On shutdown signal: finish current in-flight work, drain remaining queue,
+///      then return.
 async fn batch_publisher_loop(
+    publisher_id: usize,
     decoder: WalDecoder,
     batch_queue: BatchQueue,
     lsn_tracker: LsnTracker,
@@ -473,21 +528,21 @@ async fn batch_publisher_loop(
     slot_name: String,
     batch_config: BatchConfig,
     ack_sender: mpsc::UnboundedSender<u64>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    info!("Batch publisher task started");
+    info!("Batch publisher {} task started", publisher_id);
 
     loop {
-        // Dequeue first pending batch; this seeds a publish group.
         if let Some(first_batch) = batch_queue.dequeue().await {
             let topic = first_batch.topic.clone();
             let mut publish_records = first_batch.records;
-            let mut publish_lsns = first_batch.lsns;
-            let mut max_lsn = first_batch.max_lsn;
+            // Track all wal_ends covered by this micro-batch so each can be ACK'd.
+            let mut covered_wal_ends: BTreeSet<u64> = BTreeSet::new();
+            covered_wal_ends.insert(first_batch.wal_end);
             let mut oldest_created_at = first_batch.created_at;
             let mut source_batch_count = 1usize;
 
-            // Micro-batch across pending queue entries up to configured record cap
-            // or until flush interval expires.
+            // Micro-batch: coalesce same-topic batches up to the record cap.
             let flush_deadline =
                 Instant::now() + Duration::from_millis(batch_config.flush_interval_ms.max(1));
             while publish_records.len() < batch_config.max_records_per_batch
@@ -499,17 +554,13 @@ async fn batch_publisher_loop(
                             || publish_records.len() + next_batch.records.len()
                                 > batch_config.max_records_per_batch
                         {
-                            // Keep strict queue ordering when we cannot include this batch.
-                            if let Err(e) = batch_queue.enqueue_front(next_batch).await {
-                                error!("Failed to return batch to queue front: {}", e);
-                                metrics.process_wal_errors_inc();
-                            }
+                            // Return this batch to the front for the next iteration.
+                            batch_queue.enqueue_front(next_batch).await;
                             break;
                         }
 
-                        max_lsn = max_lsn.max(next_batch.max_lsn);
+                        covered_wal_ends.insert(next_batch.wal_end);
                         oldest_created_at = oldest_created_at.min(next_batch.created_at);
-                        publish_lsns.extend(next_batch.lsns);
                         publish_records.extend(next_batch.records);
                         source_batch_count += 1;
                     }
@@ -522,57 +573,71 @@ async fn batch_publisher_loop(
             let record_count = publish_records.len();
             let latency_ms = oldest_created_at.elapsed().as_millis() as u64;
 
-            // Stage 2: Publish combined batch to Kafka.
             match decoder.publish_batch(&topic, &publish_records).await {
-                Ok(_highest_lsn) => {
-                    // Stage 3: On success, acknowledge all LSNs in batch
+                Ok(_) => {
                     metrics.batches_sent_inc();
-                    let lsn_str = format!("{}/{}", max_lsn >> 32, max_lsn & 0xFFFFFFFF);
+
+                    // Persist the highest LSN from this publish as the resume point.
+                    let max_wal_end = covered_wal_ends.iter().copied().max().unwrap_or(0);
+                    let lsn_str = format!("{}/{}", max_wal_end >> 32, max_wal_end & 0xFFFFFFFF);
                     let _ = lsn_tracker.persist(&slot_name, &lsn_str).await;
-                    if let Err(e) = ack_sender.send(max_lsn) {
-                        error!("Failed to send acked LSN back to replication loop: {}", e);
-                        metrics.process_wal_errors_inc();
+
+                    // Send one ACK per wal_end so the fence tracker can advance correctly.
+                    for wal_end in &covered_wal_ends {
+                        if let Err(e) = ack_sender.send(*wal_end) {
+                            error!(
+                                "Publisher {}: failed to send ACK for wal_end={}: {}",
+                                publisher_id, wal_end, e
+                            );
+                            metrics.process_wal_errors_inc();
+                        }
                     }
 
                     info!(
-                        "Batch published and LSN acked: topic={} records={} source_batches={} lsns={} max_lsn={} latency_ms={}",
+                        "Publisher {}: published topic={} records={} source_batches={} wal_ends={} max_lsn={} latency_ms={}",
+                        publisher_id,
                         topic,
                         record_count,
                         source_batch_count,
-                        publish_lsns.len(),
+                        covered_wal_ends.len(),
                         lsn_str,
                         latency_ms
                     );
                 }
                 Err(e) => {
                     error!(
-                        "Failed to publish batch to topic='{}' (will retry): {} [queued for {} ms]",
-                        topic, e, latency_ms
+                        "Publisher {}: failed to publish topic='{}' (will retry): {} [queued for {}ms]",
+                        publisher_id, topic, e, latency_ms
                     );
                     metrics.kafka_send_errors_inc();
 
-                    // Re-queue combined batch for retry (exponential backoff)
-                    if let Err(requeue_err) = batch_queue
+                    // Re-assemble a single batch covering all covered wal_ends.
+                    // Use the smallest wal_end since this batch covers a range.
+                    let wal_end = covered_wal_ends.iter().copied().next().unwrap_or(0);
+                    batch_queue
                         .enqueue_front(PendingBatch {
                             records: publish_records,
-                            lsns: publish_lsns,
-                            max_lsn,
+                            wal_end,
                             created_at: oldest_created_at,
                             topic,
                         })
-                        .await
-                    {
-                        error!("Failed to re-queue batch for retry: {}", requeue_err);
-                        metrics.process_wal_errors_inc();
-                    }
+                        .await;
 
-                    // Sleep before next retry attempt
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         } else {
-            // No batches pending, sleep briefly to avoid busy-spinning
+            // Empty queue: check if we should exit.
+            if shutdown.load(Ordering::Acquire) {
+                info!(
+                    "Publisher {}: queue empty and shutdown requested — exiting",
+                    publisher_id
+                );
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    Ok(())
 }

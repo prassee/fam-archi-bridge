@@ -143,10 +143,11 @@ impl Metrics {
             .publish_duration_count
             .fetch_add(1, Ordering::Relaxed);
 
-        for (idx, bound) in PUBLISH_DURATION_BUCKETS.iter().enumerate() {
-            if seconds <= *bound {
-                self.0.publish_duration_buckets[idx].fetch_add(1, Ordering::Relaxed);
-            }
+        // Increment only the FIRST (smallest) matching bucket.
+        // The gather pass cumulates from small→large, so this produces correct
+        // Prometheus cumulative histograms without double-counting.
+        if let Some(idx) = PUBLISH_DURATION_BUCKETS.iter().position(|&b| seconds <= b) {
+            self.0.publish_duration_buckets[idx].fetch_add(1, Ordering::Relaxed);
         }
     }
 

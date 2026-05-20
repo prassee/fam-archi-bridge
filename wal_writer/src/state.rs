@@ -1,9 +1,7 @@
 #![allow(dead_code)]
 use crate::wal_parser::WalRecord;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +9,18 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+
+/// FNV-1a 64-bit hash — deterministic across Rust versions and process restarts.
+/// Unlike DefaultHasher, this guarantees stable topic→publisher routing.
+#[inline]
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 #[derive(Clone)]
 pub struct LsnTracker {
@@ -62,7 +72,11 @@ impl LsnTracker {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            fs::write(path, content).await?;
+            // Write atomically: write to .tmp then rename to avoid a corrupt file
+            // on crash between truncate and write.
+            let tmp_path = path.with_extension("tmp");
+            fs::write(&tmp_path, &content).await?;
+            fs::rename(&tmp_path, path).await?;
         }
         Ok(())
     }
@@ -73,13 +87,16 @@ impl LsnTracker {
     }
 }
 
-/// Represents a batch of CDC records pending publish to Kafka
-/// After successful Kafka publish, all LSNs in this batch are acknowledged together
+/// Represents a batch of CDC records pending publish to Kafka.
+/// `wal_end` is the WAL position of the XLogData message these records came from.
+/// After successful Kafka publish the replication loop decrements the fence for
+/// this `wal_end` and advances `confirmed_flush_lsn` only once all batches from
+/// that WAL position have been delivered.
 #[derive(Clone, Debug)]
 pub struct PendingBatch {
     pub records: Vec<WalRecord>,
-    pub lsns: Vec<u64>,
-    pub max_lsn: u64,
+    /// WAL end position of the XLogData message that produced these records.
+    pub wal_end: u64,
     pub created_at: Instant,
     pub topic: String,
 }
@@ -99,6 +116,8 @@ pub struct BatchConfig {
 pub struct BatchQueue {
     pending: Arc<RwLock<VecDeque<PendingBatch>>>,
     max_pending_batches: usize,
+    /// O(1) length counter — avoids acquiring the RwLock just to read size.
+    count: Arc<AtomicU64>,
 }
 
 impl BatchQueue {
@@ -106,6 +125,7 @@ impl BatchQueue {
         Self {
             pending: Arc::new(RwLock::new(VecDeque::new())),
             max_pending_batches,
+            count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -118,6 +138,7 @@ impl BatchQueue {
             ));
         }
         queue.push_back(batch);
+        self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -135,6 +156,7 @@ impl BatchQueue {
                 let mut queue = self.pending.write().await;
                 if queue.len() < self.max_pending_batches {
                     queue.push_back(batch);
+                    self.count.fetch_add(1, Ordering::Relaxed);
                     return Ok(wait_iterations);
                 }
             }
@@ -144,31 +166,32 @@ impl BatchQueue {
         }
     }
 
-    pub async fn enqueue_front(&self, batch: PendingBatch) -> anyhow::Result<()> {
+    /// Re-enqueue a batch at the front for retry (e.g. transient Kafka error).
+    /// Does NOT enforce capacity — this is existing data, not new data.
+    pub async fn enqueue_front(&self, batch: PendingBatch) {
         let mut queue = self.pending.write().await;
-        if queue.len() >= self.max_pending_batches {
-            return Err(anyhow::anyhow!(
-                "Pending batch queue full: {} batches awaiting Kafka publish",
-                queue.len()
-            ));
-        }
         queue.push_front(batch);
-        Ok(())
+        self.count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn dequeue(&self) -> Option<PendingBatch> {
         let mut queue = self.pending.write().await;
-        queue.pop_front()
+        let batch = queue.pop_front();
+        if batch.is_some() {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+        batch
     }
 
-    pub async fn count(&self) -> usize {
-        self.pending.read().await.len()
+    /// O(1) queue length — reads an atomic counter instead of locking the deque.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed) as usize
     }
 }
 
 /// Multi-queue router that maintains per-topic causal ordering while enabling parallel publishers.
-/// Each topic is deterministically hashed to a specific queue (0-3), ensuring all batches for
-/// the same table always go to the same publisher.
+/// Each topic is deterministically hashed to a specific queue (0..num_publishers), ensuring all
+/// batches for the same table always go to the same publisher regardless of Rust version.
 #[derive(Clone)]
 pub struct BatchQueueRouter {
     queues: Vec<BatchQueue>,
@@ -187,11 +210,9 @@ impl BatchQueueRouter {
         }
     }
 
-    /// Hash topic to determine which publisher queue it should use
+    /// Deterministically map a topic to a publisher queue using FNV-1a.
     fn topic_to_queue_index(&self, topic: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
-        topic.hash(&mut hasher);
-        (hasher.finish() as usize) % self.num_publishers
+        fnv1a_hash(topic) as usize % self.num_publishers
     }
 
     /// Enqueue batch to the queue assigned for its topic
@@ -217,13 +238,10 @@ impl BatchQueueRouter {
         self.queues[publisher_id].clone()
     }
 
-    /// Get count across all queues for monitoring
-    pub async fn total_count(&self) -> usize {
-        let mut total = 0;
-        for queue in &self.queues {
-            total += queue.count().await;
-        }
-        total
+    /// O(num_publishers) lock-free total count. Sums per-queue AtomicU64 counters —
+    /// much cheaper than the previous O(n) RwLock acquisitions.
+    pub fn total_count(&self) -> usize {
+        self.queues.iter().map(|q| q.count()).sum()
     }
 }
 

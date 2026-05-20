@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::signal;
 use tracing::{error, info};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use wal_common::AppConfig;
@@ -23,7 +23,8 @@ pub use state::LsnTracker;
 async fn main() -> Result<()> {
     let cfg = AppConfig::from_env()?;
 
-    setup_logging(&cfg)?;
+    // Hold the guard for the lifetime of main; dropping it flushes the log worker.
+    let _log_guard = setup_logging(&cfg)?;
 
     info!("Starting WAL Writer - CDC capture for PostgreSQL");
     info!(
@@ -49,25 +50,15 @@ async fn main() -> Result<()> {
     let mut wal_reader =
         pg_replication::WalReader::new(config.clone(), kafka_producer.clone(), metrics);
 
-    tokio::select! {
-        result = wal_reader.run() => {
-            if let Err(e) = result {
-                error!("Wal reader error: {}", e);
-                if let Err(err) = kafka_producer.flush(std::time::Duration::from_secs(5)) {
-                    error!("Kafka flush failed during error shutdown: {}", err);
-                }
-                std::process::exit(1);
-            }
+    // run() now handles SIGTERM/ctrl_c internally and drains publishers before returning.
+    if let Err(e) = wal_reader.run().await {
+        error!("WAL reader error: {}", e);
+        if let Err(err) = kafka_producer.flush(std::time::Duration::from_secs(5)) {
+            error!("Kafka flush failed during error shutdown: {}", err);
         }
-        _ = signal::ctrl_c() => {
-            info!("Received shutdown signal");
-        }
+        std::process::exit(1);
     }
 
-    info!("Flushing pending Kafka messages before shutdown");
-    if let Err(err) = kafka_producer.flush(std::time::Duration::from_secs(5)) {
-        error!("Kafka flush failed during shutdown: {}", err);
-    }
     info!("Shutdown complete");
     Ok(())
 }
@@ -111,11 +102,11 @@ async fn run_metrics_server(metrics: Metrics) -> Result<()> {
     }
 }
 
-fn setup_logging(config: &AppConfig) -> Result<()> {
+fn setup_logging(config: &AppConfig) -> Result<WorkerGuard> {
     let file_appender =
         RollingFileAppender::new(Rotation::DAILY, &config.logging.directory, "wal-writer.log");
 
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
         .with(EnvFilter::new(config.logging.level.as_str()))
@@ -123,6 +114,7 @@ fn setup_logging(config: &AppConfig) -> Result<()> {
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    std::mem::forget(_guard);
-    Ok(())
+    // Return the guard so main() holds it until process exit, ensuring the
+    // background log-flushing thread finishes cleanly.
+    Ok(guard)
 }
