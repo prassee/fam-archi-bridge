@@ -31,18 +31,6 @@ kubectl exec postgres-0 -n cdc -- psql -U postgres -d postgres -c \
   "CREATE PUBLICATION wal_writer_publication FOR ALL TABLES;"
 ```
 
-### Phase 2 Completed Items
-- [x] Wire `WalParser::parse()` into the replication loop end-to-end
-- [x] LSN persistence on commit
-- [x] Graceful shutdown flushing of pending Kafka messages
-- [x] Comprehensive Insert/Update/Delete/Truncate fixture tests
-- [x] Remove `eprintln!` debug output; fix unused import warnings in `decoder.rs`
-- [x] Make `Metrics` shared (`Arc`) so counters update across tasks
-- [x] Advance replication slot `confirmed_flush_lsn` via `update_applied_lsn()`
-- [x] Fix publication wiring using `WAL_WRITER_PUBLICATION`
-- [x] Verify end-to-end CDC delivery from PostgreSQL WAL to Kafka topics
-- [x] Add PostgreSQL and Kafka Grafana dashboards for replication and broker visibility
-- [x] Cap PostgreSQL WAL retention to 5GB in local Docker Compose
 
 ## Architecture
 
@@ -105,35 +93,6 @@ If you want I can implement these steps in order. Stopping now as requested.
   - Perf: `BatchQueue.count()` now O(1) via `AtomicU64`; `BatchQueueRouter.total_count()` sums 4 atomic loads (no RwLock).
   - L-4: Replaced `DefaultHasher` with inline FNV-1a for deterministic topic→publisher routing.
   - Config defaults tuned for 100k/s: `replication_batch_size` 2000→5000, `poll_interval_ms` 50→10 ms, `pending_batch_queue_size` 1000→4000, `kafka.batch_size` 16384→65536, `queue_buffering_max_ms` 50→10 ms.
-- Fixed wal-writer readiness probe by correcting endpoint from `/ready` (404) to `/health` in k8s/deployment.yaml — app only exposes `/health` and `/metrics` endpoints.
-- Fixed replication slot contention by scaling wal-writer deployment from 2 replicas to 1 replica in k8s/deployment.yaml — multiple pods cannot share single replication slot.
-- Wired the parser into the replication loop end-to-end and verified CDC delivery into Kafka topics.
-- Fixed replication slot advancement by calling `update_applied_lsn()`, allowing PostgreSQL to advance `confirmed_flush_lsn` and recycle WAL.
-- Added `WAL_WRITER_PUBLICATION` configuration, correcting publication selection for logical replication.
-- Persisted commit LSN progress and verified slot lag converges after replication catches up.
-- Added fixture-based WAL parser tests covering Relation plus Insert/Update/Delete decoding.
-- Cleaned up logging so info-level output is summary-oriented instead of per-change verbose.
-- Added PostgreSQL and Kafka Grafana dashboard support, including datasource fixes and stable template queries for Kafka exporter metrics.
-- Updated the PostgreSQL dashboard to show WAL size, database size, and slot lag in GB.
-- Capped PostgreSQL WAL retention to 5GB in Docker Compose using `max_wal_size` and `max_slot_wal_keep_size`.
-- Converted WAL Writer runtime container from Rust to Go for active development.
-- Deprecated Rust WAL Writer component and moved it behind an opt-in Docker Compose profile.
-- Fixed high-severity SQL injection in replication slot reset by parameterising slot-name SQL in `wal_writer_go/main.go`.
-- Fixed high-severity DELETE partial-row ambiguity by tracking relation replica identity and emitting `partial_old_tuple` in CDC delete events.
-- Fixed high-severity Tokio blocking behavior in `wal_consumer/src/main.rs` by using `spawn_blocking` for metadata fetch and async sleep in discovery loop.
-- Fixed data pump scale issues by removing `ORDER BY random()` sampling, batching UPI updates, increasing pool max conns, and wiring UPI update ticker.
-- Fixed critical LSN at-most-once delivery by introducing `confirmedLSN` atomic tracking — PostgreSQL WAL retention position now only advances after successful Kafka publish.
-- Fixed critical blocking Kafka I/O in replication loop by decoupling WAL parsing from publishing via `recordQueue` channel and dedicated `publisher()` goroutine.
-- Fixed `parseUpdate` dead `rem = rem` branch — now returns an error on unrecognised tuple tag to prevent buffer misparsing.
-- Fixed publish retry loop ignoring context cancellation — now checks `ctx.Err()` before each backoff sleep.
-- Fixed recursive `runReplication` on slot-loss — replaced with `outer: for {}` loop and `continue outer`.
-- Fixed raw WAL byte metric labels — `walMessageType()` helper maps bytes to human-readable names.
-- Fixed Kafka `BatchSize` not wired — now reads from `WAL_WRITER_KAFKA_BATCH_SIZE` env var.
-- Fixed password credential leak in log output — `redactPassword()` helper sanitizes pgconn connection error messages before logging.
-- Fixed wal_consumer offset commit counters resetting on failure — counters now accumulate across failures so retry fires sooner.
-- Fixed critical runtime config gap in `wal_common/src/lib.rs` so replication and logging env vars are no longer ignored at runtime.
-- Fixed critical resume bug in `wal_writer/src/pg_replication.rs` by starting replication from persisted slot LSN instead of always from `0/0`.
-- Fixed critical data-loss mode in `wal_writer/src/pg_replication.rs` by failing fast on pending batch queue overflow instead of logging and continuing.
 
 ## Kafka Batching (Current Rust Implementation)
 
