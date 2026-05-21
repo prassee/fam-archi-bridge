@@ -17,22 +17,22 @@ impl AppConfig {
     pub fn from_env() -> Result<Self, env::VarError> {
         let state_dir = env::var("WAL_WRITER_STATE_DIR").ok().map(PathBuf::from);
         let replication_batch_size = env::var("WAL_WRITER_REPLICATION_BATCH_SIZE")
-            .unwrap_or_else(|_| "2000".to_string())
+            .unwrap_or_else(|_| "5000".to_string())
             .parse()
-            .unwrap_or(2000);
+            .unwrap_or(5000);
         let replication_poll_interval_ms = env::var("WAL_WRITER_REPLICATION_POLL_INTERVAL_MS")
-            .unwrap_or_else(|_| "50".to_string())
+            .unwrap_or_else(|_| "10".to_string())
             .parse()
-            .unwrap_or(50);
+            .unwrap_or(10);
         let logging_directory = env::var("WAL_WRITER_LOGGING_DIRECTORY")
             .unwrap_or_else(|_| "/var/log/wal-writer".to_string());
         let logging_level =
             env::var("WAL_WRITER_LOGGING_LEVEL").unwrap_or_else(|_| "info".to_string());
 
         let pending_batch_queue_size = env::var("WAL_WRITER_PENDING_BATCH_QUEUE_SIZE")
-            .unwrap_or_else(|_| "1000".to_string())
+            .unwrap_or_else(|_| "4000".to_string())
             .parse()
-            .unwrap_or(1000);
+            .unwrap_or(4000);
 
         Ok(Self {
             pg: PostgresConfig {
@@ -58,13 +58,13 @@ impl AppConfig {
                     .parse()
                     .unwrap_or(5),
                 batch_size: env::var("WAL_WRITER_KAFKA_BATCH_SIZE")
-                    .unwrap_or_else(|_| "16384".to_string())
+                    .unwrap_or_else(|_| "65536".to_string())
                     .parse()
-                    .unwrap_or(16384),
+                    .unwrap_or(65536),
                 queue_buffering_max_ms: env::var("WAL_WRITER_KAFKA_QUEUE_BUFFERING_MAX_MS")
-                    .unwrap_or_else(|_| "50".to_string())
+                    .unwrap_or_else(|_| "10".to_string())
                     .parse()
-                    .unwrap_or(50),
+                    .unwrap_or(10),
                 compression: env::var("WAL_WRITER_KAFKA_COMPRESSION").ok(),
                 debug_no_kafka: env::var("WAL_WRITER_DEBUG_NO_KAFKA")
                     .map(|v| v.eq_ignore_ascii_case("true"))

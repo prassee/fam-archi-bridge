@@ -259,9 +259,27 @@ impl WalParser {
                         });
                     }
                 }
+                // Origin message: sent when replication stream starts or changes origin.
+                // 8 bytes LSN + NUL-terminated name. Skip it entirely.
+                'O' => {
+                    let _origin_commit_lsn = reader.read_u64()?;
+                    let _origin_name = reader.read_cstring()?;
+                }
+                // Type message: mapping of OID to schema.name. Not needed for CDC.
+                'Y' => {
+                    let _data_type_id = reader.read_u32()?;
+                    let _namespace = reader.read_cstring()?;
+                    let _name = reader.read_cstring()?;
+                }
                 _ => {
-                    // Unknown/unsupported message type: best-effort skip or break
-                    break;
+                    // Unknown pgoutput message type: return an error so the
+                    // caller can log and handle rather than silently dropping
+                    // the rest of the buffer.
+                    return Err(anyhow::anyhow!(
+                        "Unknown pgoutput message type: 0x{:02x} ('{}'); cannot continue parsing this WAL buffer",
+                        msg_type as u8,
+                        msg_type
+                    ));
                 }
             }
         }
@@ -308,8 +326,13 @@ fn parse_tuple_to_row(
                     .unwrap_or(0),
             ),
             'u' => (
+                // pgoutput 'u' = column not transmitted (unchanged TOAST or not in replica
+                // identity). Treat as null downstream so arrow_converter doesn't panic on
+                // (is_null=false, value=None). The distinction between "null" and
+                // "not-transmitted" is lost here; a future Column.is_unchanged field would
+                // preserve the semantic if needed.
                 None,
-                false,
+                true,
                 relation
                     .and_then(|r| r.get_column_by_index(idx).map(|c| c.name.to_string()))
                     .unwrap_or_else(|| format!("col{}", idx + 1)),
